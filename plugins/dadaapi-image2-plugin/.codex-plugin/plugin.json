@@ -1,0 +1,40 @@
+{
+  "name": "dadaapi-image2-plugin",
+  "version": "0.1.0+codex.20260615052526",
+  "description": "哒哒API Image2 is a local GPT Image compatible Codex plugin for generating, editing, extracting, and previewing image assets.",
+  "author": {
+    "name": "哒哒API"
+  },
+  "homepage": "https://github.com/Tbthr/dadaapi-image2-plugin",
+  "repository": "https://github.com/Tbthr/dadaapi-image2-plugin",
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "image-generation",
+    "gpt-image-2",
+    "image-editing",
+    "codex"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "哒哒API Image2",
+    "shortDescription": "Generate and edit images with 哒哒API previews",
+    "longDescription": "Use 哒哒API Image2 to generate images, edit images, extract opaque assets from flattened designs, and run async image jobs from Codex. The plugin reads API settings from ~/.codex/image2-mcp.env, saves output locally, and returns generated images as inline previews whenever possible.",
+    "developerName": "哒哒API",
+    "category": "Creativity",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Generate an image and show me the preview",
+      "Edit this image and preview the result",
+      "Extract transparent elements from this design"
+    ],
+    "brandColor": "#19C7C2",
+    "composerIcon": "./assets/icon.png",
+    "logo": "./assets/logo.png"
+  },
+  "mcpServers": "./.mcp.json"
+}

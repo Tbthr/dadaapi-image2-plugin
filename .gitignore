@@ -1,0 +1,25 @@
+node_modules/
+.npm-cache/
+
+# Local configuration and secrets
+.env
+.env.*
+*.env
+image2-mcp.env
+!.env.example
+
+# Generated runtime data
+/assets/
+/jobs/
+plugins/dadaapi-image2-plugin/assets/*
+!plugins/dadaapi-image2-plugin/assets/
+!plugins/dadaapi-image2-plugin/assets/icon.png
+!plugins/dadaapi-image2-plugin/assets/logo.png
+plugins/dadaapi-image2-plugin/jobs/
+*.log
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
