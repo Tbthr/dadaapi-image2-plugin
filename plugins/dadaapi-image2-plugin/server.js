@@ -123,7 +123,7 @@ const cancelJobSchema = z.object({
 });
 
 const server = new McpServer({
-  name: "dadaapi-image2",
+  name: "DadaAPI Image2",
   version: "0.1.0"
 });
 

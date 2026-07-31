@@ -43,7 +43,7 @@ npm ci
 ```
 
 ```toml
-[mcp_servers.image2]
+[mcp_servers.dadaapi-image2]
 command = "node"
 args = ["/absolute/path/to/dadaapi-image2-plugin/plugins/dadaapi-image2-plugin/dist/server.js"]
 ```

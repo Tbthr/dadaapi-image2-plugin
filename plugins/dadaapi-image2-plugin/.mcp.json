@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "image2": {
+    "dadaapi-image2": {
       "command": "node",
       "args": [
         "./dist/server.js"

@@ -1,9 +1,9 @@
 ---
-name: image2
-description: Generate, edit, extract, or preview images with 哒哒API Image2. Use when a user requests image generation, image-to-image editing, element extraction from a design, asynchronous image generation, or inline previews of generated image files.
+name: dadaapi-image2
+description: Generate, edit, extract, or preview images with DadaAPI Image2. Use when a user requests image generation, image-to-image editing, element extraction from a design, asynchronous image generation, or inline previews of generated image files.
 ---
 
-# 哒哒API Image2
+# DadaAPI Image2
 
 ## Choose tools
 

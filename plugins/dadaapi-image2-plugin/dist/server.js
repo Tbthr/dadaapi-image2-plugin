@@ -21206,7 +21206,7 @@ var cancelJobSchema = external_exports.object({
   job_id: external_exports.string().min(1).describe("Job id returned by image2_start_generation.")
 });
 var server = new McpServer({
-  name: "dadaapi-image2",
+  name: "DadaAPI Image2",
   version: "0.1.0"
 });
 server.tool(
