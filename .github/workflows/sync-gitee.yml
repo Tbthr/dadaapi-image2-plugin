@@ -65,6 +65,7 @@ jobs:
             "$repository_api")
           case "$http_code" in
             200)
+              jq -c '{full_name, path, name, private, public, owner: (.owner.login // .owner.name), message, code, keys: keys}' "$response"
               jq -e --arg repository "$GITEE_REPOSITORY" \
                 '.full_name == $repository and .private == false' "$response" >/dev/null || {
                 echo "::error title=Invalid Gitee repository response::The target must be an accessible public Gitee repository."
