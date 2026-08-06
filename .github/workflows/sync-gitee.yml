@@ -79,16 +79,35 @@ jobs:
                 -w '%{http_code}' \
                 -X POST \
                 -H "$authorization" \
-                --form-string "name=$repository_name" \
-                --form-string "path=$repository_name" \
-                --form-string "description=哒哒API Image2 Codex 插件" \
-                --form-string "auto_init=false" \
-                --form-string "public=1" \
+                -H 'Accept: application/json' \
+                --data-urlencode "name=$repository_name" \
+                --data-urlencode "path=$repository_name" \
+                --data-urlencode "description=哒哒API Image2 Codex 插件" \
+                --data-urlencode "auto_init=false" \
+                --data-urlencode "public=1" \
                 "https://gitee.com/api/v5/user/repos")
-              if [ "$created_code" != 201 ] || ! jq -e \
-                --arg repository "$GITEE_REPOSITORY" \
-                '.full_name == $repository and .private == false' "$created_response" >/dev/null; then
+              if [ "$created_code" != 201 ]; then
                 echo "::error title=Unable to create Gitee repository::Gitee API returned HTTP $created_code."
+                jq -c '{message, code}' "$created_response" >&2 || true
+                exit 1
+              fi
+              repository_ready=false
+              for attempt in 1 2 3 4 5 6; do
+                verification_code=$(curl -sS --connect-timeout 20 --max-time 60 \
+                  -o "$response" \
+                  -w '%{http_code}' \
+                  -H "$authorization" \
+                  "$repository_api")
+                if [ "$verification_code" = 200 ] && jq -e \
+                  --arg repository "$GITEE_REPOSITORY" \
+                  '.full_name == $repository and .private == false' "$response" >/dev/null; then
+                  repository_ready=true
+                  break
+                fi
+                [ "$attempt" -eq 6 ] || sleep 5
+              done
+              if [ "$repository_ready" != true ]; then
+                echo "::error title=Gitee repository was not created::The API returned 201, but the target repository is not publicly readable yet."
                 jq -c '{message, code}' "$created_response" >&2 || true
                 exit 1
               fi
