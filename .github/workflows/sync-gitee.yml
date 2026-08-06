@@ -167,11 +167,13 @@ jobs:
             local remote_sha="$2"
             local method=POST
             local file_code
+            local expected_code=201
             local encoded_path
             encoded_path=$(printf '%s' "$path" | jq -sRr @uri)
             base64 -w 0 -- "$path" > "$content_path"
             if [ -n "$remote_sha" ]; then
               method=PUT
+              expected_code=200
             fi
             file_url="$repository_api/contents/$encoded_path"
             if [ "$method" = PUT ]; then
@@ -200,7 +202,7 @@ jobs:
                 --data-urlencode 'branch=main' \
                 "$file_url")
             fi
-            if [ "$file_code" != 201 ]; then
+            if [ "$file_code" != "$expected_code" ]; then
               echo "::error title=Unable to sync Gitee file $path::Gitee API returned HTTP $file_code."
               jq -c '.' "$response" >&2 || true
               exit 1
