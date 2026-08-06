@@ -130,6 +130,8 @@ jobs:
               -H "$authorization" \
               -H 'Accept: application/json' \
               --data-urlencode "access_token=$GITEE_TOKEN" \
+              --data-urlencode "name=$repository_name" \
+              --data-urlencode "path=$repository_name" \
               --data-urlencode 'public=1' \
               "$repository_api")
             if [ "$made_public_code" != 200 ]; then
