@@ -136,7 +136,7 @@ jobs:
               "$repository_api")
             if [ "$made_public_code" != 200 ]; then
               echo "::error title=Unable to publish Gitee repository::Gitee API returned HTTP $made_public_code."
-              jq -c '{message, code}' "$made_public_response" >&2 || true
+              jq -c '.' "$made_public_response" >&2 || true
               exit 1
             fi
           fi
