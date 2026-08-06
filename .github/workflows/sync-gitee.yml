@@ -208,9 +208,9 @@ jobs:
 
           while IFS=$'\t' read -r path sha; do
             [ -n "$path" ] || continue
-            local_sha=$(awk -F '\t' -v target="$path" '$1 == target { print $2; exit }' "$local_paths")
-            if [ "$local_sha" != "$sha" ]; then
-              sync_file "$path" "$sha"
+            remote_sha=$(awk -F '\t' -v target="$path" '$1 == target { print $2; exit }' "$remote_paths")
+            if [ "$sha" != "$remote_sha" ]; then
+              sync_file "$path" "$remote_sha"
             fi
           done < "$local_paths"
 
