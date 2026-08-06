@@ -65,10 +65,9 @@ jobs:
             "$repository_api")
           case "$http_code" in
             200)
-              jq -c '{full_name, path, name, private, public, owner: (.owner.login // .owner.name), message, code, keys: keys}' "$response"
               jq -e --arg repository "$GITEE_REPOSITORY" \
-                '.full_name == $repository and .private == false' "$response" >/dev/null || {
-                echo "::error title=Invalid Gitee repository response::The target must be an accessible public Gitee repository."
+                '.full_name == $repository' "$response" >/dev/null || {
+                echo "::error title=Invalid Gitee repository response::The target does not match the configured repository."
                 exit 1
               }
               echo "Gitee repository $GITEE_REPOSITORY already exists."
@@ -102,18 +101,18 @@ jobs:
                   "$repository_api")
                 if [ "$verification_code" = 200 ] && jq -e \
                   --arg repository "$GITEE_REPOSITORY" \
-                  '.full_name == $repository and .private == false' "$response" >/dev/null; then
+                  '.full_name == $repository' "$response" >/dev/null; then
                   repository_ready=true
                   break
                 fi
                 [ "$attempt" -eq 6 ] || sleep 5
               done
               if [ "$repository_ready" != true ]; then
-                echo "::error title=Gitee repository was not created::The API returned 201, but the target repository is not publicly readable yet."
+                echo "::error title=Gitee repository was not created::The API returned 201, but the target repository is not available yet."
                 jq -c '{message, code}' "$created_response" >&2 || true
                 exit 1
               fi
-              echo "Created public Gitee repository $GITEE_REPOSITORY."
+              echo "Created Gitee repository $GITEE_REPOSITORY."
               ;;
             *)
               echo "::error title=Unable to inspect Gitee repository::Gitee API returned HTTP $http_code."
@@ -121,6 +120,56 @@ jobs:
               exit 1
               ;;
           esac
+
+          if ! jq -e '.private == false' "$response" >/dev/null; then
+            made_public_response="$RUNNER_TEMP/dada-gitee-repository-public.json"
+            made_public_code=$(curl -sS --connect-timeout 20 --max-time 60 \
+              -o "$made_public_response" \
+              -w '%{http_code}' \
+              -X PATCH \
+              -H "$authorization" \
+              -H 'Accept: application/json' \
+              --data-urlencode "access_token=$GITEE_TOKEN" \
+              --data-urlencode 'public=1' \
+              "$repository_api")
+            if [ "$made_public_code" != 200 ]; then
+              echo "::error title=Unable to publish Gitee repository::Gitee API returned HTTP $made_public_code."
+              jq -c '{message, code}' "$made_public_response" >&2 || true
+              exit 1
+            fi
+          fi
+
+          repository_public=false
+          for attempt in 1 2 3 4 5 6; do
+            verification_code=$(curl -sS --connect-timeout 20 --max-time 60 \
+              -o "$response" \
+              -w '%{http_code}' \
+              -H "$authorization" \
+              "$repository_api")
+            if [ "$verification_code" = 200 ] && jq -e \
+              --arg repository "$GITEE_REPOSITORY" \
+              '.full_name == $repository and .private == false' "$response" >/dev/null; then
+              repository_public=true
+              break
+            fi
+            [ "$attempt" -eq 6 ] || sleep 5
+          done
+          if [ "$repository_public" != true ]; then
+            echo "::error title=Gitee repository is not public::The mirror must be public so users can access it without credentials."
+            exit 1
+          fi
+
+          anonymous_response="$RUNNER_TEMP/dada-gitee-repository-public-check.json"
+          anonymous_code=$(curl -sS --connect-timeout 20 --max-time 60 \
+            -o "$anonymous_response" \
+            -w '%{http_code}' \
+            "$repository_api")
+          if [ "$anonymous_code" != 200 ] || ! jq -e \
+            --arg repository "$GITEE_REPOSITORY" \
+            '.full_name == $repository and .private == false' "$anonymous_response" >/dev/null; then
+            echo "::error title=Gitee repository is not publicly readable::The mirror is not accessible without a token."
+            exit 1
+          fi
 
       - name: Push main branch and missing tags to Gitee
         env:
