@@ -132,7 +132,7 @@ jobs:
               --data-urlencode "access_token=$GITEE_TOKEN" \
               --data-urlencode "name=$repository_name" \
               --data-urlencode "path=$repository_name" \
-              --data-urlencode 'public=1' \
+              --data-urlencode 'private=false' \
               "$repository_api")
             if [ "$made_public_code" != 200 ]; then
               echo "::error title=Unable to publish Gitee repository::Gitee API returned HTTP $made_public_code."
