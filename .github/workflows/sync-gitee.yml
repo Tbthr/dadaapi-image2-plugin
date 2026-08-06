@@ -111,7 +111,10 @@ jobs:
           repository_api="https://gitee.com/api/v5/repos/$GITEE_REPOSITORY"
           branch_api="$repository_api/branches/main"
           response="$RUNNER_TEMP/dada-gitee-sync-response.json"
-          branch_created=false
+          remote_paths="$RUNNER_TEMP/dada-gitee-remote-paths.tsv"
+          local_paths="$RUNNER_TEMP/dada-gitee-local-paths.tsv"
+          content_path="$RUNNER_TEMP/dada-gitee-file-content.b64"
+          file_url=""
 
           branch_code=$(curl -sS --connect-timeout 20 --max-time 60 \
             -o "$response" \
@@ -119,48 +122,27 @@ jobs:
             -H "$authorization" \
             "$branch_api")
           if [ "$branch_code" = 404 ]; then
-            bootstrap_response="$RUNNER_TEMP/dada-gitee-bootstrap-response.json"
-            bootstrap_content=$(printf '%s\n' 'Gitee mirror bootstrap; replaced by the GitHub source on this run.' | base64 -w 0)
             bootstrap_code=$(curl -sS --connect-timeout 20 --max-time 60 \
-              -o "$bootstrap_response" \
+              -o "$response" \
               -w '%{http_code}' \
               -X POST \
               -H "$authorization" \
               -H 'Accept: application/json' \
               --data-urlencode "access_token=$GITEE_TOKEN" \
-              --data-urlencode "content=$bootstrap_content" \
+              --data-urlencode "content=$(printf '%s' 'Gitee mirror bootstrap; replaced by the GitHub source on this run.' | base64 -w 0)" \
               --data-urlencode 'message=Initialize Gitee mirror' \
               --data-urlencode 'branch=main' \
               "$repository_api/contents/.gitee-bootstrap")
             if [ "$bootstrap_code" != 201 ]; then
               echo "::error title=Unable to initialize Gitee main branch::Gitee API returned HTTP $bootstrap_code."
-              jq -c '{message, code}' "$bootstrap_response" >&2 || true
+              jq -c '.' "$response" >&2 || true
               exit 1
             fi
-            branch_created=true
           elif [ "$branch_code" != 200 ]; then
             echo "::error title=Unable to inspect Gitee main branch::Gitee API returned HTTP $branch_code."
-            jq -c '{message, code}' "$response" >&2 || true
+            jq -c '.' "$response" >&2 || true
             exit 1
           fi
-
-          branch_code=$(curl -sS --connect-timeout 20 --max-time 60 \
-            -o "$response" \
-            -w '%{http_code}' \
-            -H "$authorization" \
-            "$branch_api")
-          if [ "$branch_code" != 200 ]; then
-            echo "::error title=Gitee main branch is unavailable::Gitee API returned HTTP $branch_code."
-            jq -c '{message, code}' "$response" >&2 || true
-            exit 1
-          fi
-
-          local_paths="$RUNNER_TEMP/dada-gitee-local-paths.txt"
-          remote_paths="$RUNNER_TEMP/dada-gitee-remote-paths.txt"
-          actions_path="$RUNNER_TEMP/dada-gitee-actions.json"
-          payload_path="$RUNNER_TEMP/dada-gitee-commit.json"
-          git ls-files > "$local_paths"
-          printf '[]\n' > "$actions_path"
 
           tree_code=$(curl -sS --connect-timeout 20 --max-time 60 \
             -o "$response" \
@@ -169,68 +151,90 @@ jobs:
             "$repository_api/git/trees/main?recursive=1")
           if [ "$tree_code" != 200 ]; then
             echo "::error title=Unable to inspect Gitee file tree::Gitee API returned HTTP $tree_code."
-            jq -c '{message, code}' "$response" >&2 || true
+            jq -c '.' "$response" >&2 || true
             exit 1
           fi
-          jq -r '.tree[]? | if type == "object" then select(.type == "blob") | .path else . end' \
-            "$response" | sort -u > "$remote_paths"
-
-          while IFS= read -r path; do
+          jq -r '.tree[]? | select(.type == "blob") | [.path, .sha] | @tsv' "$response" | sort -u > "$remote_paths"
+          git ls-files | while IFS= read -r path; do
             [ -n "$path" ] || continue
-            content_path="$RUNNER_TEMP/dada-gitee-file-content.b64"
+            sha=$(git hash-object -- "$path")
+            printf '%s\t%s\n' "$path" "$sha"
+          done | sort -u > "$local_paths"
+
+          sync_file() {
+            local path="$1"
+            local remote_sha="$2"
+            local method=POST
+            local file_code
+            local encoded_path
+            encoded_path=$(printf '%s' "$path" | jq -sRr @uri)
             base64 -w 0 -- "$path" > "$content_path"
-            mode=$(git ls-files --stage -- "$path" | awk 'NR == 1 { print $1 }')
-            executable=false
-            [ "$mode" = 100755 ] && executable=true
-            action=create
-            grep -Fqx -- "$path" "$remote_paths" && action=update
-            jq --arg action "$action" \
-              --arg path "$path" \
-              --rawfile content "$content_path" \
-              --argjson executable "$executable" \
-              '. + [{action: $action, path: $path, content: $content, encoding: "base64", execute_filemode: $executable}]' \
-              "$actions_path" > "$actions_path.next"
-            mv "$actions_path.next" "$actions_path"
+            if [ -n "$remote_sha" ]; then
+              method=PUT
+            fi
+            file_url="$repository_api/contents/$encoded_path"
+            if [ "$method" = PUT ]; then
+              file_code=$(curl -sS --connect-timeout 20 --max-time 180 \
+                -o "$response" \
+                -w '%{http_code}' \
+                -X PUT \
+                -H "$authorization" \
+                -H 'Accept: application/json' \
+                --data-urlencode "access_token=$GITEE_TOKEN" \
+                --data-urlencode "content@$content_path" \
+                --data-urlencode "message=Sync from GitHub ${GITHUB_SHA}" \
+                --data-urlencode 'branch=main' \
+                --data-urlencode "sha=$remote_sha" \
+                "$file_url")
+            else
+              file_code=$(curl -sS --connect-timeout 20 --max-time 180 \
+                -o "$response" \
+                -w '%{http_code}' \
+                -X POST \
+                -H "$authorization" \
+                -H 'Accept: application/json' \
+                --data-urlencode "access_token=$GITEE_TOKEN" \
+                --data-urlencode "content@$content_path" \
+                --data-urlencode "message=Sync from GitHub ${GITHUB_SHA}" \
+                --data-urlencode 'branch=main' \
+                "$file_url")
+            fi
+            if [ "$file_code" != 201 ]; then
+              echo "::error title=Unable to sync Gitee file $path::Gitee API returned HTTP $file_code."
+              jq -c '.' "$response" >&2 || true
+              exit 1
+            fi
+          }
+
+          while IFS=$'\t' read -r path sha; do
+            [ -n "$path" ] || continue
+            local_sha=$(awk -F '\t' -v target="$path" '$1 == target { print $2; exit }' "$local_paths")
+            if [ "$local_sha" != "$sha" ]; then
+              sync_file "$path" "$sha"
+            fi
           done < "$local_paths"
 
-          while IFS= read -r path; do
+          while IFS=$'\t' read -r path sha; do
             [ -n "$path" ] || continue
-            if ! grep -Fqx -- "$path" "$local_paths"; then
-              jq --arg path "$path" \
-                '. + [{action: "delete", path: $path}]' \
-                "$actions_path" > "$actions_path.next"
-              mv "$actions_path.next" "$actions_path"
+            if ! awk -F '\t' -v target="$path" '$1 == target { found=1 } END { exit found ? 0 : 1 }' "$local_paths"; then
+              encoded_path=$(printf '%s' "$path" | jq -sRr @uri)
+              delete_code=$(curl -sS --connect-timeout 20 --max-time 180 \
+                -o "$response" \
+                -w '%{http_code}' \
+                -X DELETE \
+                -H "$authorization" \
+                -H 'Accept: application/json' \
+                --data-urlencode "access_token=$GITEE_TOKEN" \
+                --data-urlencode "sha=$sha" \
+                --data-urlencode "message=Sync from GitHub ${GITHUB_SHA}" \
+                "$repository_api/contents/$encoded_path")
+              if [ "$delete_code" != 200 ] && [ "$delete_code" != 204 ]; then
+                echo "::error title=Unable to delete Gitee file $path::Gitee API returned HTTP $delete_code."
+                jq -c '.' "$response" >&2 || true
+                exit 1
+              fi
             fi
           done < "$remote_paths"
-
-          action_count=$(jq 'length' "$actions_path")
-          if [ "$action_count" -eq 0 ]; then
-            echo "Gitee mirror already matches the GitHub file tree."
-            exit 0
-          fi
-
-          jq -n \
-            --arg branch main \
-            --arg message "Sync from GitHub ${GITHUB_SHA}" \
-            --slurpfile actions "$actions_path" \
-            '{branch: $branch, message: $message, actions: $actions[0]}' \
-            > "$payload_path"
-          commit_response="$RUNNER_TEMP/dada-gitee-commit-response.json"
-          commit_code=$(curl -sS --connect-timeout 20 --max-time 120 \
-            -o "$commit_response" \
-            -w '%{http_code}' \
-            -X POST \
-            -H "$authorization" \
-            -H 'Accept: application/json' \
-            -H 'Content-Type: application/json' \
-            --data-binary "@$payload_path" \
-            "$repository_api/commits")
-          if [ "$commit_code" != 201 ] || ! jq -e '.sha | type == "string" and length > 0' "$commit_response" >/dev/null; then
-            echo "::error title=Unable to sync Gitee file tree::Gitee API returned HTTP $commit_code."
-            jq -c '{message, code, error}' "$commit_response" >&2 || true
-            exit 1
-          fi
-          echo "Committed $action_count file actions to Gitee at $(jq -r '.sha' "$commit_response")."
 
       - name: Publish and verify Gitee repository
         env:
