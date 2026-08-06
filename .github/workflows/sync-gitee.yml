@@ -177,7 +177,8 @@ jobs:
 
           while IFS= read -r path; do
             [ -n "$path" ] || continue
-            content=$(base64 -w 0 -- "$path")
+            content_path="$RUNNER_TEMP/dada-gitee-file-content.b64"
+            base64 -w 0 -- "$path" > "$content_path"
             mode=$(git ls-files --stage -- "$path" | awk 'NR == 1 { print $1 }')
             executable=false
             [ "$mode" = 100755 ] && executable=true
@@ -185,7 +186,7 @@ jobs:
             grep -Fqx -- "$path" "$remote_paths" && action=update
             jq --arg action "$action" \
               --arg path "$path" \
-              --arg content "$content" \
+              --rawfile content "$content_path" \
               --argjson executable "$executable" \
               '. + [{action: $action, path: $path, content: $content, encoding: "base64", execute_filemode: $executable}]' \
               "$actions_path" > "$actions_path.next"
