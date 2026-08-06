@@ -17,6 +17,7 @@ jobs:
   sync:
     environment: production-release
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       GITEE_REPOSITORY: ${{ vars.GITEE_REPOSITORY || 'lyq_power/dadaapi-image2-plugin' }}
       GITEE_USERNAME: ${{ vars.GITEE_USERNAME || 'lyq_power' }}
