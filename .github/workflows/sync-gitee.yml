@@ -18,8 +18,8 @@ jobs:
     environment: production-release
     runs-on: ubuntu-latest
     env:
-      GITEE_REPOSITORY: ${{ vars.GITEE_REPOSITORY }}
-      GITEE_USERNAME: ${{ vars.GITEE_USERNAME }}
+      GITEE_REPOSITORY: ${{ vars.GITEE_REPOSITORY || 'lyq_power/dadaapi-image2-plugin' }}
+      GITEE_USERNAME: ${{ vars.GITEE_USERNAME || 'lyq_power' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -47,6 +47,59 @@ jobs:
             echo "::error title=Missing Gitee token::Add a GITEE_TOKEN Actions secret with write access to $GITEE_REPOSITORY."
             exit 1
           fi
+
+      - name: Create Gitee repository when missing
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          set -euo pipefail
+          authorization="Authorization: token $GITEE_TOKEN"
+          repository_name="${GITEE_REPOSITORY#*/}"
+          repository_api="https://gitee.com/api/v5/repos/$GITEE_REPOSITORY"
+          response="$RUNNER_TEMP/dada-gitee-repository.json"
+
+          http_code=$(curl -sS --connect-timeout 20 --max-time 60 \
+            -o "$response" \
+            -w '%{http_code}' \
+            -H "$authorization" \
+            "$repository_api")
+          case "$http_code" in
+            200)
+              jq -e --arg repository "$GITEE_REPOSITORY" \
+                '.full_name == $repository and .private == false' "$response" >/dev/null || {
+                echo "::error title=Invalid Gitee repository response::The target must be an accessible public Gitee repository."
+                exit 1
+              }
+              echo "Gitee repository $GITEE_REPOSITORY already exists."
+              ;;
+            404)
+              created_response="$RUNNER_TEMP/dada-gitee-repository-created.json"
+              created_code=$(curl -sS --connect-timeout 20 --max-time 60 \
+                -o "$created_response" \
+                -w '%{http_code}' \
+                -X POST \
+                -H "$authorization" \
+                --form-string "name=$repository_name" \
+                --form-string "path=$repository_name" \
+                --form-string "description=哒哒API Image2 Codex 插件" \
+                --form-string "auto_init=false" \
+                --form-string "public=1" \
+                "https://gitee.com/api/v5/user/repos")
+              if [ "$created_code" != 201 ] || ! jq -e \
+                --arg repository "$GITEE_REPOSITORY" \
+                '.full_name == $repository and .private == false' "$created_response" >/dev/null; then
+                echo "::error title=Unable to create Gitee repository::Gitee API returned HTTP $created_code."
+                jq -c '{message, code}' "$created_response" >&2 || true
+                exit 1
+              fi
+              echo "Created public Gitee repository $GITEE_REPOSITORY."
+              ;;
+            *)
+              echo "::error title=Unable to inspect Gitee repository::Gitee API returned HTTP $http_code."
+              jq -c '{message, code}' "$response" >&2 || true
+              exit 1
+              ;;
+          esac
 
       - name: Push main branch and missing tags to Gitee
         env:
