@@ -3225,8 +3225,8 @@ var require_utils = __commonJS({
       }
       return ind;
     }
-    function removeDotSegments(path2) {
-      let input = path2;
+    function removeDotSegments(path3) {
+      let input = path3;
       const output = [];
       let nextSlash = -1;
       let len = 0;
@@ -3478,8 +3478,8 @@ var require_schemes = __commonJS({
         wsComponent.secure = void 0;
       }
       if (wsComponent.resourceName) {
-        const [path2, query] = wsComponent.resourceName.split("?");
-        wsComponent.path = path2 && path2 !== "/" ? path2 : void 0;
+        const [path3, query] = wsComponent.resourceName.split("?");
+        wsComponent.path = path3 && path3 !== "/" ? path3 : void 0;
         wsComponent.query = query;
         wsComponent.resourceName = void 0;
       }
@@ -6872,12 +6872,12 @@ var require_dist = __commonJS({
         throw new Error(`Unknown format "${name}"`);
       return f;
     };
-    function addFormats(ajv, list, fs2, exportName) {
+    function addFormats(ajv, list, fs3, exportName) {
       var _a;
       var _b;
       (_a = (_b = ajv.opts.code).formats) !== null && _a !== void 0 ? _a : _b.formats = (0, codegen_1._)`require("ajv-formats/dist/formats").${exportName}`;
       for (const f of list)
-        ajv.addFormat(f, fs2[f]);
+        ajv.addFormat(f, fs3[f]);
     }
     module.exports = exports = formatsPlugin;
     Object.defineProperty(exports, "__esModule", { value: true });
@@ -6886,11 +6886,11 @@ var require_dist = __commonJS({
 });
 
 // server.js
-import fs from "node:fs";
+import fs2 from "node:fs";
 import os from "node:os";
-import path from "node:path";
+import path2 from "node:path";
 import { execFileSync } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomUUID as randomUUID2 } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 // node_modules/zod/v3/external.js
@@ -7371,8 +7371,8 @@ function getErrorMap() {
 
 // node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue = (params) => {
-  const { data, path: path2, errorMaps, issueData } = params;
-  const fullPath = [...path2, ...issueData.path || []];
+  const { data, path: path3, errorMaps, issueData } = params;
+  const fullPath = [...path3, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -7488,11 +7488,11 @@ var errorUtil;
 
 // node_modules/zod/v3/types.js
 var ParseInputLazyPath = class {
-  constructor(parent, value, path2, key) {
+  constructor(parent, value, path3, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path2;
+    this._path = path3;
     this._key = key;
   }
   get path() {
@@ -11129,10 +11129,10 @@ function assignProp(target, prop, value) {
     configurable: true
   });
 }
-function getElementAtPath(obj, path2) {
-  if (!path2)
+function getElementAtPath(obj, path3) {
+  if (!path3)
     return obj;
-  return path2.reduce((acc, key) => acc?.[key], obj);
+  return path3.reduce((acc, key) => acc?.[key], obj);
 }
 function promiseAllObject(promisesObj) {
   const keys = Object.keys(promisesObj);
@@ -11452,11 +11452,11 @@ function aborted(x, startIndex = 0) {
   }
   return false;
 }
-function prefixIssues(path2, issues) {
+function prefixIssues(path3, issues) {
   return issues.map((iss) => {
     var _a;
     (_a = iss).path ?? (_a.path = []);
-    iss.path.unshift(path2);
+    iss.path.unshift(path3);
     return iss;
   });
 }
@@ -21105,13 +21105,755 @@ var StdioServerTransport = class {
   }
 };
 
+// lib/image-transport.js
+import fs from "node:fs";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
+var DEFAULT_MAX_OUTPUT_BYTES = 32 * 1024 * 1024;
+var ERROR_BODY_LIMIT = 2048;
+var DOWNLOAD_RETRY_DELAY_MS = 500;
+var DOWNLOAD_RETRY_AFTER_CAP_MS = 5e3;
+var Image2Error = class extends Error {
+  constructor(message, options = {}) {
+    super(message, options.cause ? { cause: options.cause } : void 0);
+    this.name = "Image2Error";
+    this.code = options.code || "CONFIG_ERROR";
+    this.stage = options.stage || "plugin";
+    this.status = options.status ?? null;
+    this.requestId = options.requestId ?? null;
+    this.clientRequestId = options.clientRequestId ?? null;
+    this.retryable = Boolean(options.retryable);
+    this.details = options.details || null;
+    this.partialImages = options.partialImages || null;
+  }
+};
+function toPublicError(error2) {
+  const normalized = error2 instanceof Image2Error ? error2 : new Image2Error(error2?.message || String(error2), {
+    code: "CONFIG_ERROR",
+    stage: "plugin",
+    cause: error2
+  });
+  const result = {
+    code: normalized.code,
+    stage: normalized.stage,
+    message: normalized.message,
+    status: normalized.status,
+    request_id: normalized.requestId,
+    client_request_id: normalized.clientRequestId,
+    retryable: normalized.retryable
+  };
+  if (normalized.details) result.details = normalized.details;
+  return result;
+}
+function toolErrorPayload(error2) {
+  const payload = {
+    ok: false,
+    error: toPublicError(error2)
+  };
+  if (Array.isArray(error2?.partialImages) && error2.partialImages.length) {
+    payload.partial_images = error2.partialImages;
+  }
+  return payload;
+}
+async function requestApiResponse({
+  endpoint,
+  method = "POST",
+  headers = {},
+  body,
+  signal,
+  timeoutMs,
+  fetchImpl = fetch
+}) {
+  const clientRequestId = randomUUID();
+  const requestHeaders = new Headers(headers);
+  requestHeaders.set("X-Client-Request-Id", clientRequestId);
+  const fetched = await fetchWithTimeout(endpoint, {
+    method,
+    headers: requestHeaders,
+    body
+  }, {
+    signal,
+    timeoutMs,
+    fetchImpl,
+    stage: "api_request",
+    networkErrorCode: "NETWORK_ERROR",
+    requestId: null,
+    clientRequestId
+  });
+  return {
+    response: fetched.response,
+    request_id: fetched.response.headers.get("x-request-id"),
+    client_request_id: clientRequestId,
+    lifecycle: fetched.lifecycle
+  };
+}
+async function requestApiJson(options) {
+  const result = await requestApiResponse(options);
+  try {
+    const json = await parseApiJsonResponse(result.response, {
+      requestId: result.request_id,
+      clientRequestId: result.client_request_id,
+      secret: options.secret,
+      lifecycle: result.lifecycle
+    });
+    const { lifecycle, ...publicResult } = result;
+    return { ...publicResult, json };
+  } finally {
+    result.lifecycle.cleanup();
+  }
+}
+async function parseApiJsonResponse(response, context = {}) {
+  let text;
+  try {
+    text = await response.text();
+  } catch (cause) {
+    throw networkFailure(cause, {
+      lifecycle: context.lifecycle,
+      code: "NETWORK_ERROR",
+      stage: "api_response",
+      requestId: context.requestId,
+      clientRequestId: context.clientRequestId,
+      retryable: false,
+      endpoint: response.url
+    });
+  }
+  let json;
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch (cause) {
+    if (!response.ok) {
+      throw new Image2Error(redactAndTruncate(text || `${response.status} ${response.statusText}`, context.secret, 500), {
+        code: "API_HTTP_ERROR",
+        stage: "api_response",
+        status: response.status,
+        requestId: context.requestId,
+        clientRequestId: context.clientRequestId,
+        retryable: isRetryableStatus(response.status),
+        details: { response: redactAndTruncate(text, context.secret) },
+        cause
+      });
+    }
+    throw new Image2Error(`Image API returned invalid JSON (HTTP ${response.status}).`, {
+      code: "INVALID_IMAGE_DATA",
+      stage: "api_response",
+      status: response.status,
+      requestId: context.requestId,
+      clientRequestId: context.clientRequestId,
+      details: { response: redactAndTruncate(text, context.secret) },
+      cause
+    });
+  }
+  if (!response.ok) {
+    const rawMessage = json?.error?.message || json?.message || text || `${response.status} ${response.statusText}`;
+    throw new Image2Error(redactAndTruncate(rawMessage, context.secret, 500), {
+      code: "API_HTTP_ERROR",
+      stage: "api_response",
+      status: response.status,
+      requestId: context.requestId,
+      clientRequestId: context.clientRequestId,
+      retryable: isRetryableStatus(response.status),
+      details: { response: redactAndTruncate(text, context.secret) }
+    });
+  }
+  return json;
+}
+async function persistImagesFromResponse(json, options) {
+  const items = Array.isArray(json?.data) ? json.data : [];
+  const saved = [];
+  for (const item of items) {
+    const payload = imagePayloadFromItem(item);
+    if (payload) saved.push(await persistImagePayload(payload, { ...options, kind: "final" }));
+  }
+  if (!saved.length) {
+    const b64 = findBase64Image(json);
+    if (b64) {
+      saved.push(await persistImagePayload({ type: "base64", value: b64 }, {
+        ...options,
+        kind: "final"
+      }));
+    }
+  }
+  if (!saved.length) {
+    throw new Image2Error("Image API returned no usable images.", {
+      code: "EMPTY_IMAGE_RESULT",
+      stage: "image_decode",
+      requestId: options.requestId,
+      clientRequestId: options.clientRequestId,
+      retryable: false,
+      details: { response_keys: objectKeys(json) }
+    });
+  }
+  return saved;
+}
+async function consumeImageStream(response, options) {
+  if (!response.body) {
+    throw new Image2Error("Streaming response body is empty.", {
+      code: "INCOMPLETE_STREAM",
+      stage: "stream_parse",
+      requestId: options.requestId,
+      clientRequestId: options.clientRequestId
+    });
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const parser = new SseFrameParser();
+  const partials = [];
+  const finals = [];
+  let rawUsage = null;
+  const processFrames = async (frames) => {
+    for (const frame of frames) {
+      const event = parseSseEvent(frame);
+      if (!event || event.data === "[DONE]") continue;
+      let payload;
+      try {
+        payload = JSON.parse(event.data);
+      } catch (cause) {
+        throw new Image2Error("Image stream contained invalid JSON.", {
+          code: "INVALID_IMAGE_DATA",
+          stage: "stream_parse",
+          requestId: options.requestId,
+          clientRequestId: options.clientRequestId,
+          details: { event: event.event, data: truncate(event.data, 500) },
+          partialImages: partials,
+          cause
+        });
+      }
+      if (event.event === "error" || payload?.error) {
+        const message = payload?.error?.message || payload?.message || "Image stream returned an error event.";
+        throw new Image2Error(truncate(String(message), 500), {
+          code: "API_HTTP_ERROR",
+          stage: "stream_parse",
+          requestId: options.requestId,
+          clientRequestId: options.clientRequestId,
+          retryable: false,
+          partialImages: partials
+        });
+      }
+      if (payload?.usage) rawUsage = payload.usage;
+      const eventType = `${event.event || ""} ${payload?.type || ""}`.toLowerCase();
+      const imagePayload = imagePayloadFromItem(payload);
+      if (!imagePayload) continue;
+      if (eventType.includes("partial")) {
+        partials.push(await persistImagePayload(imagePayload, { ...options, kind: "partial" }));
+      } else if (eventType.includes("completed")) {
+        finals.push(await persistImagePayload(imagePayload, { ...options, kind: "final" }));
+      }
+    }
+  };
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      await processFrames(parser.push(decoder.decode(value, { stream: true })));
+    }
+    const trailingText = decoder.decode();
+    await processFrames(parser.push(trailingText));
+    await processFrames(parser.finish());
+  } catch (error2) {
+    if (error2 instanceof Image2Error) throw error2;
+    const failure = networkFailure(error2, {
+      lifecycle: options.lifecycle,
+      code: "NETWORK_ERROR",
+      stage: "stream_parse",
+      requestId: options.requestId,
+      clientRequestId: options.clientRequestId,
+      retryable: false,
+      endpoint: options.endpoint
+    });
+    failure.partialImages = partials;
+    throw failure;
+  }
+  if (!finals.length) {
+    throw new Image2Error("Image stream ended without a completed image.", {
+      code: "INCOMPLETE_STREAM",
+      stage: "stream_parse",
+      requestId: options.requestId,
+      clientRequestId: options.clientRequestId,
+      retryable: false,
+      partialImages: partials
+    });
+  }
+  return {
+    partial_images: partials,
+    images: finals,
+    raw_usage: rawUsage,
+    request_id: options.requestId || null,
+    client_request_id: options.clientRequestId || null
+  };
+}
+function parseSseEvent(frame) {
+  const event = { event: null, data: "" };
+  const data = [];
+  for (const line of frame.split(/\r?\n/)) {
+    if (!line || line.startsWith(":")) continue;
+    const colon = line.indexOf(":");
+    const field = colon === -1 ? line : line.slice(0, colon);
+    let value = colon === -1 ? "" : line.slice(colon + 1);
+    if (value.startsWith(" ")) value = value.slice(1);
+    if (field === "event") event.event = value;
+    if (field === "data") data.push(value);
+  }
+  event.data = data.join("\n");
+  return event.data ? event : null;
+}
+function detectImageFormat(bytes) {
+  if (bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+    return { format: "png", extension: "png", mime: "image/png" };
+  }
+  if (bytes.length >= 3 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255) {
+    return { format: "jpeg", extension: "jpg", mime: "image/jpeg" };
+  }
+  if (bytes.length >= 12 && bytes.toString("ascii", 0, 4) === "RIFF" && bytes.toString("ascii", 8, 12) === "WEBP") {
+    return { format: "webp", extension: "webp", mime: "image/webp" };
+  }
+  return null;
+}
+function mimeTypeForPath(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  return {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif"
+  }[ext] || "application/octet-stream";
+}
+function safeEndpoint(value) {
+  try {
+    const url = new URL(value);
+    return `${url.origin}${url.pathname}`;
+  } catch {
+    return "<invalid-url>";
+  }
+}
+async function persistImagePayload(payload, options) {
+  const maxOutputBytes2 = positiveInteger(options.maxOutputBytes, DEFAULT_MAX_OUTPUT_BYTES);
+  let bytes;
+  let source;
+  if (payload.type === "url") {
+    bytes = await downloadImage(payload.value, { ...options, maxOutputBytes: maxOutputBytes2 });
+    source = "url";
+  } else {
+    bytes = decodeBase64Image(payload.value, maxOutputBytes2, options);
+    source = "base64";
+  }
+  const detected = detectImageFormat(bytes);
+  if (!detected) {
+    throw new Image2Error("Image response is not a supported PNG, JPEG, or WebP file.", {
+      code: "INVALID_IMAGE_DATA",
+      stage: "image_decode",
+      requestId: options.requestId,
+      clientRequestId: options.clientRequestId,
+      details: { bytes: bytes.length, source }
+    });
+  }
+  const filePath = atomicWriteImage(bytes, detected.extension, options);
+  return {
+    path: filePath,
+    kind: options.kind || "final",
+    format: detected.format,
+    source,
+    bytes: bytes.length
+  };
+}
+function imagePayloadFromItem(item) {
+  if (!item || typeof item !== "object") return null;
+  if (typeof item.b64_json === "string") return { type: "base64", value: item.b64_json };
+  for (const key of ["image", "data"]) {
+    if (typeof item[key] === "string" && (item[key].startsWith("data:") || looksLikeBase64(item[key]))) {
+      return { type: "base64", value: item[key] };
+    }
+  }
+  if (typeof item.url === "string") {
+    return item.url.startsWith("data:") ? { type: "base64", value: item.url } : { type: "url", value: item.url };
+  }
+  return null;
+}
+function decodeBase64Image(value, maxOutputBytes2, context) {
+  let encoded = String(value || "").trim();
+  if (encoded.startsWith("data:")) {
+    const match = encoded.match(/^data:[^,]*;base64,([\s\S]+)$/i);
+    if (!match) {
+      throw new Image2Error("Image API returned an unsupported data URL.", {
+        code: "INVALID_IMAGE_DATA",
+        stage: "image_decode",
+        requestId: context.requestId,
+        clientRequestId: context.clientRequestId
+      });
+    }
+    encoded = match[1];
+  }
+  encoded = encoded.replace(/\s/g, "").replace(/-/g, "+").replace(/_/g, "/");
+  if (!encoded || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) {
+    throw new Image2Error("Image API returned invalid base64 image data.", {
+      code: "INVALID_IMAGE_DATA",
+      stage: "image_decode",
+      requestId: context.requestId,
+      clientRequestId: context.clientRequestId
+    });
+  }
+  if (encoded.length > Math.ceil(maxOutputBytes2 / 3) * 4 + 4) {
+    throw outputTooLarge(maxOutputBytes2, context);
+  }
+  const padding = encoded.length % 4;
+  if (padding) encoded += "=".repeat(4 - padding);
+  const bytes = Buffer.from(encoded, "base64");
+  if (!bytes.length) {
+    throw new Image2Error("Image response was empty.", {
+      code: "INVALID_IMAGE_DATA",
+      stage: "image_decode",
+      requestId: context.requestId,
+      clientRequestId: context.clientRequestId
+    });
+  }
+  if (bytes.length > maxOutputBytes2) throw outputTooLarge(maxOutputBytes2, context);
+  return bytes;
+}
+async function downloadImage(value, options) {
+  let target;
+  try {
+    target = new URL(value, `${options.baseUrl.replace(/\/+$/, "")}/`);
+  } catch (cause) {
+    throw new Image2Error("Image API returned an invalid download URL.", {
+      code: "INVALID_IMAGE_DATA",
+      stage: "image_download",
+      requestId: options.requestId,
+      clientRequestId: options.clientRequestId,
+      cause
+    });
+  }
+  if (!(/* @__PURE__ */ new Set(["http:", "https:"])).has(target.protocol)) {
+    throw new Image2Error("Image download URL must use HTTP or HTTPS.", {
+      code: "INVALID_IMAGE_DATA",
+      stage: "image_download",
+      requestId: options.requestId,
+      clientRequestId: options.clientRequestId,
+      details: { url: safeEndpoint(target) }
+    });
+  }
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let fetched = null;
+    try {
+      fetched = await fetchWithTimeout(target, {
+        method: "GET",
+        headers: {
+          accept: "image/png,image/jpeg,image/webp,image/*;q=0.8,*/*;q=0.1"
+        }
+      }, {
+        signal: options.signal,
+        timeoutMs: options.downloadTimeoutMs,
+        fetchImpl: options.fetchImpl || fetch,
+        stage: "image_download",
+        networkErrorCode: "IMAGE_DOWNLOAD_ERROR",
+        requestId: options.requestId,
+        clientRequestId: options.clientRequestId
+      });
+      const response = fetched.response;
+      if (!response.ok) {
+        const retryable = isRetryableStatus(response.status);
+        if (attempt === 0 && retryable) {
+          const delayMs = retryDelayMs(response.headers.get("retry-after"), options.downloadRetryDelayMs);
+          fetched.lifecycle.cleanup();
+          fetched = null;
+          await sleep(delayMs, options.signal);
+          continue;
+        }
+        throw new Image2Error(`Image download failed (HTTP ${response.status}).`, {
+          code: "IMAGE_DOWNLOAD_ERROR",
+          stage: "image_download",
+          status: response.status,
+          requestId: options.requestId,
+          clientRequestId: options.clientRequestId,
+          retryable,
+          details: { url: safeEndpoint(target) }
+        });
+      }
+      return await readResponseBytes(response, options.maxOutputBytes, options);
+    } catch (error2) {
+      const normalized = error2 instanceof Image2Error ? error2 : networkFailure(error2, {
+        lifecycle: fetched?.lifecycle,
+        code: "IMAGE_DOWNLOAD_ERROR",
+        stage: "image_download",
+        requestId: options.requestId,
+        clientRequestId: options.clientRequestId,
+        retryable: true,
+        endpoint: target
+      });
+      const retryable = ["IMAGE_DOWNLOAD_ERROR", "REQUEST_TIMEOUT"].includes(normalized.code) && normalized.status !== 403;
+      if (attempt === 0 && retryable) {
+        await sleep(positiveInteger(options.downloadRetryDelayMs, DOWNLOAD_RETRY_DELAY_MS), options.signal);
+        continue;
+      }
+      throw normalized;
+    } finally {
+      fetched?.lifecycle.cleanup();
+    }
+  }
+  throw new Image2Error("Image download failed.", {
+    code: "IMAGE_DOWNLOAD_ERROR",
+    stage: "image_download",
+    requestId: options.requestId,
+    clientRequestId: options.clientRequestId
+  });
+}
+async function readResponseBytes(response, maxOutputBytes2, context) {
+  const declaredLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > maxOutputBytes2) {
+    throw outputTooLarge(maxOutputBytes2, context);
+  }
+  if (!response.body) {
+    throw new Image2Error("Image download response body was empty.", {
+      code: "IMAGE_DOWNLOAD_ERROR",
+      stage: "image_download",
+      requestId: context.requestId,
+      clientRequestId: context.clientRequestId
+    });
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxOutputBytes2) {
+      await reader.cancel();
+      throw outputTooLarge(maxOutputBytes2, context);
+    }
+    chunks.push(Buffer.from(value));
+  }
+  if (!total) {
+    throw new Image2Error("Image download response was empty.", {
+      code: "INVALID_IMAGE_DATA",
+      stage: "image_decode",
+      requestId: context.requestId,
+      clientRequestId: context.clientRequestId
+    });
+  }
+  return Buffer.concat(chunks, total);
+}
+function atomicWriteImage(bytes, extension, options) {
+  const safePrefix = String(options.prefix || "image2").replace(/[^a-zA-Z0-9._-]/g, "_");
+  const filename = `${safePrefix}-${options.kind || "final"}-${Date.now()}-${randomUUID().slice(0, 8)}.${extension}`;
+  const filePath = path.join(options.outputDir, filename);
+  const temporaryPath = `${filePath}.${randomUUID().slice(0, 8)}.part`;
+  try {
+    fs.mkdirSync(options.outputDir, { recursive: true });
+    fs.writeFileSync(temporaryPath, bytes, { flag: "wx" });
+    fs.renameSync(temporaryPath, filePath);
+    return filePath;
+  } catch (cause) {
+    try {
+      fs.unlinkSync(temporaryPath);
+    } catch {
+    }
+    throw new Image2Error("Failed to save the generated image.", {
+      code: "OUTPUT_WRITE_ERROR",
+      stage: "image_persist",
+      requestId: options.requestId,
+      clientRequestId: options.clientRequestId,
+      details: { directory: options.outputDir, cause: causeDetails(cause) },
+      cause
+    });
+  }
+}
+async function fetchWithTimeout(url, requestOptions, context) {
+  const lifecycle = createRequestLifecycle(context.signal, context.timeoutMs);
+  try {
+    const response = await context.fetchImpl(url, { ...requestOptions, signal: lifecycle.signal });
+    return { response, lifecycle };
+  } catch (cause) {
+    lifecycle.cleanup();
+    throw networkFailure(cause, {
+      lifecycle,
+      code: context.networkErrorCode,
+      stage: context.stage,
+      requestId: context.requestId,
+      clientRequestId: context.clientRequestId,
+      retryable: context.stage === "image_download",
+      endpoint: url
+    });
+  }
+}
+function createRequestLifecycle(externalSignal, timeoutValue) {
+  const controller = new AbortController();
+  const state = { timedOut: false };
+  const timeoutMs = positiveInteger(timeoutValue, 3e5);
+  const onAbort = () => controller.abort(externalSignal?.reason);
+  if (externalSignal?.aborted) onAbort();
+  else externalSignal?.addEventListener("abort", onAbort, { once: true });
+  const timer = setTimeout(() => {
+    state.timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  let cleaned = false;
+  return {
+    signal: controller.signal,
+    timeoutMs,
+    externalSignal,
+    get timedOut() {
+      return state.timedOut;
+    },
+    cleanup() {
+      if (cleaned) return;
+      cleaned = true;
+      clearTimeout(timer);
+      externalSignal?.removeEventListener("abort", onAbort);
+    }
+  };
+}
+function networkFailure(cause, context) {
+  if (context.lifecycle?.timedOut) {
+    return new Image2Error(`Request timed out after ${context.lifecycle.timeoutMs}ms.`, {
+      code: "REQUEST_TIMEOUT",
+      stage: context.stage,
+      requestId: context.requestId,
+      clientRequestId: context.clientRequestId,
+      retryable: context.retryable,
+      details: { endpoint: safeEndpoint(context.endpoint), cause: causeDetails(cause) },
+      cause
+    });
+  }
+  if (context.lifecycle?.externalSignal?.aborted) {
+    return new Image2Error("Request was cancelled.", {
+      code: "CANCELLED",
+      stage: context.stage,
+      requestId: context.requestId,
+      clientRequestId: context.clientRequestId,
+      cause
+    });
+  }
+  const message = context.stage === "image_download" ? "Image download network request failed." : context.stage === "stream_parse" ? "Failed while reading the image stream." : context.stage === "api_response" ? "Failed while reading the Image API response." : "Image API network request failed.";
+  return new Image2Error(message, {
+    code: context.code,
+    stage: context.stage,
+    requestId: context.requestId,
+    clientRequestId: context.clientRequestId,
+    retryable: context.retryable,
+    details: { endpoint: safeEndpoint(context.endpoint), cause: causeDetails(cause) },
+    cause
+  });
+}
+var SseFrameParser = class {
+  constructor() {
+    this.buffer = "";
+  }
+  push(text) {
+    this.buffer += text;
+    const frames = [];
+    while (true) {
+      const match = /\r?\n\r?\n/.exec(this.buffer);
+      if (!match) break;
+      frames.push(this.buffer.slice(0, match.index));
+      this.buffer = this.buffer.slice(match.index + match[0].length);
+    }
+    return frames;
+  }
+  finish() {
+    const trailing = this.buffer.trim();
+    this.buffer = "";
+    return trailing ? [trailing] : [];
+  }
+};
+function findBase64Image(value) {
+  if (!value || typeof value !== "object") return null;
+  if (typeof value.b64_json === "string") return value.b64_json;
+  if (typeof value.image === "string" && looksLikeBase64(value.image)) return value.image;
+  if (typeof value.data === "string" && looksLikeBase64(value.data)) return value.data;
+  for (const child of Object.values(value)) {
+    if (Array.isArray(child)) {
+      for (const item of child) {
+        const found = findBase64Image(item);
+        if (found) return found;
+      }
+    } else if (child && typeof child === "object") {
+      const found = findBase64Image(child);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+function looksLikeBase64(text) {
+  const compact = text.replace(/\s/g, "");
+  return compact.length >= 12 && /^[A-Za-z0-9+/=_-]+$/.test(compact);
+}
+function outputTooLarge(maxOutputBytes2, context) {
+  return new Image2Error(`Image output exceeds the ${maxOutputBytes2} byte limit.`, {
+    code: "INVALID_IMAGE_DATA",
+    stage: "image_decode",
+    requestId: context.requestId,
+    clientRequestId: context.clientRequestId,
+    details: { max_output_bytes: maxOutputBytes2 }
+  });
+}
+function retryDelayMs(retryAfter, fallback) {
+  const defaultDelay = positiveInteger(fallback, DOWNLOAD_RETRY_DELAY_MS);
+  if (!retryAfter) return defaultDelay;
+  const seconds = Number(retryAfter);
+  if (Number.isFinite(seconds)) return Math.min(DOWNLOAD_RETRY_AFTER_CAP_MS, Math.max(0, seconds * 1e3));
+  const dateMs = Date.parse(retryAfter);
+  if (!Number.isFinite(dateMs)) return defaultDelay;
+  return Math.min(DOWNLOAD_RETRY_AFTER_CAP_MS, Math.max(0, dateMs - Date.now()));
+}
+function isRetryableStatus(status) {
+  return status === 408 || status === 429 || status >= 500;
+}
+function positiveInteger(value, fallback) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+function objectKeys(value) {
+  return value && typeof value === "object" ? Object.keys(value).slice(0, 20) : [];
+}
+function redactAndTruncate(value, secret, limit = ERROR_BODY_LIMIT) {
+  let text = String(value || "");
+  if (secret) text = text.split(secret).join("<redacted>");
+  return truncate(text, limit);
+}
+function truncate(value, limit) {
+  const text = String(value || "");
+  return text.length > limit ? `${text.slice(0, limit)}...` : text;
+}
+function causeDetails(error2) {
+  const cause = error2?.cause || error2;
+  const details = {};
+  for (const key of ["code", "errno", "syscall", "hostname"]) {
+    if (cause?.[key] !== void 0) details[key] = String(cause[key]);
+  }
+  return Object.keys(details).length ? details : null;
+}
+async function sleep(ms, signal) {
+  if (signal?.aborted) {
+    throw new Image2Error("Request was cancelled.", {
+      code: "CANCELLED",
+      stage: "image_download"
+    });
+  }
+  await new Promise((resolve, reject) => {
+    const finish = () => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(new Image2Error("Request was cancelled.", {
+        code: "CANCELLED",
+        stage: "image_download"
+      }));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 // server.js
-var SERVER_ROOT = path.dirname(fileURLToPath(import.meta.url));
-var DEFAULT_OUTPUT_DIR = path.join(SERVER_ROOT, "assets");
-var JOBS_DIR = path.join(SERVER_ROOT, "jobs");
-var INPUT_CACHE_DIR = path.join(SERVER_ROOT, "input-cache");
-var ASSETS_FILE = path.join(SERVER_ROOT, "assets.json");
-var DEFAULT_ENV_FILE = path.join(os.homedir(), ".codex", "image2-mcp.env");
+var SERVER_ROOT = path2.dirname(fileURLToPath(import.meta.url));
+var DEFAULT_OUTPUT_DIR = path2.join(SERVER_ROOT, "assets");
+var JOBS_DIR = path2.join(SERVER_ROOT, "jobs");
+var INPUT_CACHE_DIR = path2.join(SERVER_ROOT, "input-cache");
+var ASSETS_FILE = path2.join(SERVER_ROOT, "assets.json");
+var DEFAULT_ENV_FILE = path2.join(os.homedir(), ".codex", "image2-mcp.env");
 var IMAGE2_SIZES = /* @__PURE__ */ new Set(["auto", "1024x1024", "1024x1536", "1536x1024"]);
 var IMAGE2_QUALITIES = /* @__PURE__ */ new Set(["auto", "high", "medium", "low"]);
 var BACKGROUNDS = /* @__PURE__ */ new Set(["auto", "opaque"]);
@@ -21129,9 +21871,11 @@ var apiKey = process.env.IMAGE2_API_KEY;
 var baseUrl = normalizeBaseUrl(process.env.IMAGE2_BASE_URL || "https://dadaapi.com");
 var defaultModel = process.env.IMAGE2_MODEL || "gpt-image-2";
 var defaultOutputDir = expandHome(process.env.IMAGE2_DEFAULT_OUTPUT_DIR || DEFAULT_OUTPUT_DIR);
-fs.mkdirSync(defaultOutputDir, { recursive: true });
-fs.mkdirSync(JOBS_DIR, { recursive: true });
-fs.mkdirSync(INPUT_CACHE_DIR, { recursive: true });
+var requestTimeoutMs = positiveIntegerEnv("IMAGE2_REQUEST_TIMEOUT_MS", 3e5);
+var downloadTimeoutMs = positiveIntegerEnv("IMAGE2_DOWNLOAD_TIMEOUT_MS", 6e4);
+var maxOutputBytes = positiveIntegerEnv("IMAGE2_MAX_OUTPUT_BYTES", 32 * 1024 * 1024);
+fs2.mkdirSync(JOBS_DIR, { recursive: true });
+fs2.mkdirSync(INPUT_CACHE_DIR, { recursive: true });
 var inputBudgetFields = {
   image_asset_ids: external_exports.array(external_exports.string()).max(8).optional().describe("Previously registered Image2 asset ids to use as input references. Prefer this over re-sending old image context."),
   input_preprocessing: external_exports.boolean().default(true).describe("Downsample and compress local input images before upload to keep request bodies within budget."),
@@ -21205,6 +21949,9 @@ var getJobSchema = external_exports.object({
 var cancelJobSchema = external_exports.object({
   job_id: external_exports.string().min(1).describe("Job id returned by image2_start_generation.")
 });
+var doctorSchema = external_exports.object({
+  network: external_exports.boolean().default(true).describe("Also check API connectivity and model visibility without generating an image.")
+});
 var server = new McpServer({
   name: "DadaAPI Image2",
   version: "0.1.0"
@@ -21213,44 +21960,50 @@ server.tool(
   "image2_generate",
   "Generate GPT Image compatible assets and save them to disk. Supports optional streaming partial images.",
   generateSchema.shape,
-  async (args) => {
+  withToolErrors(async (args) => {
     const result = await generateImages(args);
     return jsonToolResult(result);
-  }
+  })
 );
 server.tool(
   "image2_edit",
   "Edit one or more images with a GPT Image compatible API and save the outputs to disk. GPT Image2 does not support transparent backgrounds, alpha output, or transparent PNG generation.",
   editSchema.shape,
-  async (args) => {
+  withToolErrors(async (args) => {
     const result = await editImages(args);
     return jsonToolResult(result);
-  }
+  })
+);
+server.tool(
+  "image2_doctor",
+  "Check Image2 configuration, output directory access, API connectivity, and model visibility without generating an image.",
+  doctorSchema.shape,
+  withToolErrors(async (args) => jsonToolResult(await runDoctor(args)))
 );
 server.tool(
   "image2_register_asset",
   "Register a local image as a reusable lightweight Image2 asset. Future edits can pass image_asset_ids instead of repeating historical image context.",
   registerAssetSchema.shape,
-  async (args) => {
+  withToolErrors(async (args) => {
     const result = registerImageAsset(args);
     return jsonToolResult(result);
-  }
+  })
 );
 server.tool(
   "image2_extract_elements",
   "Use Image2 image editing to isolate or recreate described subjects/elements from a source image as opaque PNG/WebP assets. GPT Image2 does not support transparent backgrounds, alpha output, or transparent PNG generation.",
   extractElementsSchema.shape,
-  async (args) => {
+  withToolErrors(async (args) => {
     const result = await extractDesignElements(args);
     return jsonToolResult(result);
-  }
+  })
 );
 server.tool(
   "image2_start_generation",
   "Start a background image generation job. Use image2_get_job to poll status later.",
   startSchema.shape,
-  async (args) => {
-    const jobId = randomUUID();
+  withToolErrors(async (args) => {
+    const jobId = randomUUID2();
     const controller = new AbortController();
     const now = (/* @__PURE__ */ new Date()).toISOString();
     const record2 = {
@@ -21269,9 +22022,11 @@ server.tool(
     generateImages(args, controller.signal).then((result) => {
       updateJob(jobId, { status: "completed", result });
     }).catch((error2) => {
+      const publicError = toPublicError(error2);
       updateJob(jobId, {
         status: controller.signal.aborted ? "cancelled" : "failed",
-        error: errorToJson(error2)
+        error: publicError,
+        ...Array.isArray(error2?.partialImages) && error2.partialImages.length ? { partial_images: error2.partialImages } : {}
       });
     });
     return jsonToolResult({
@@ -21279,25 +22034,25 @@ server.tool(
       status: "running",
       message: "Generation started. Poll with image2_get_job."
     });
-  }
+  })
 );
 server.tool(
   "image2_get_job",
   "Get the current state and saved output paths for a background image generation job.",
   getJobSchema.shape,
-  async ({ job_id }) => {
+  withToolErrors(async ({ job_id }) => {
     const record2 = jobs.get(job_id) || readJob(job_id);
     if (!record2) {
       throw new Error(`Unknown job_id: ${job_id}`);
     }
     return jsonToolResult(publicJob(record2));
-  }
+  })
 );
 server.tool(
   "image2_cancel_job",
   "Cancel a running background image generation job.",
   cancelJobSchema.shape,
-  async ({ job_id }) => {
+  withToolErrors(async ({ job_id }) => {
     const record2 = jobs.get(job_id);
     if (!record2) {
       const saved = readJob(job_id);
@@ -21309,7 +22064,7 @@ server.tool(
       updateJob(job_id, { status: "cancelled" });
     }
     return jsonToolResult(publicJob(jobs.get(job_id)));
-  }
+  })
 );
 if (!apiKey) {
   console.error("IMAGE2_API_KEY is not configured. Set it in ~/.codex/image2-mcp.env.");
@@ -21321,24 +22076,143 @@ async function generateImages(args, signal) {
   const request = buildJsonRequest(args);
   const endpoint = `${baseUrl}/images/generations`;
   if (args.stream) {
-    const streamResult = await requestImageStream(endpoint, request, outputDir, args.filename_prefix, args.output_format, signal);
-    return {
-      mode: "generation",
+    const apiResult2 = await requestApiResponse({
       endpoint,
-      model: request.model,
-      stream: true,
-      ...streamResult
-    };
+      headers: {
+        ...authHeaders(),
+        "content-type": "application/json"
+      },
+      body: JSON.stringify(request),
+      signal,
+      timeoutMs: requestTimeoutMs
+    });
+    try {
+      if (!apiResult2.response.ok) {
+        await parseApiJsonResponse(apiResult2.response, {
+          requestId: apiResult2.request_id,
+          clientRequestId: apiResult2.client_request_id,
+          secret: apiKey,
+          lifecycle: apiResult2.lifecycle
+        });
+      }
+      const streamResult = await consumeImageStream(apiResult2.response, transportOptions({
+        outputDir,
+        prefix: args.filename_prefix,
+        outputFormat: args.output_format,
+        signal,
+        requestId: apiResult2.request_id,
+        clientRequestId: apiResult2.client_request_id,
+        lifecycle: apiResult2.lifecycle,
+        endpoint
+      }));
+      return {
+        mode: "generation",
+        endpoint,
+        model: request.model,
+        stream: true,
+        ...streamResult
+      };
+    } finally {
+      apiResult2.lifecycle.cleanup();
+    }
   }
-  const json = await requestJson(endpoint, request, signal);
-  const saved = saveImagesFromResponse(json, outputDir, args.filename_prefix, args.output_format);
+  const apiResult = await requestApiJson({
+    endpoint,
+    headers: {
+      ...authHeaders(),
+      "content-type": "application/json"
+    },
+    body: JSON.stringify(request),
+    signal,
+    timeoutMs: requestTimeoutMs,
+    secret: apiKey
+  });
+  const saved = await persistImagesFromResponse(apiResult.json, transportOptions({
+    outputDir,
+    prefix: args.filename_prefix,
+    outputFormat: args.output_format,
+    signal,
+    requestId: apiResult.request_id,
+    clientRequestId: apiResult.client_request_id
+  }));
   return {
     mode: "generation",
     endpoint,
     model: request.model,
     stream: false,
     images: saved,
-    raw_usage: json.usage || null
+    raw_usage: apiResult.json.usage || null,
+    request_id: apiResult.request_id,
+    client_request_id: apiResult.client_request_id
+  };
+}
+async function runDoctor(args) {
+  const checks = [];
+  const addCheck = (name, status2, message) => checks.push({ name, status: status2, message });
+  const nodeMajor = Number(process.versions.node.split(".")[0]);
+  addCheck(
+    "node",
+    nodeMajor >= 20 ? "pass" : "fail",
+    `Node ${process.versions.node}; version 20 or newer is required.`
+  );
+  addCheck(
+    "configuration",
+    apiKey ? "pass" : "fail",
+    apiKey ? "IMAGE2_API_KEY is configured." : "IMAGE2_API_KEY is not configured in ~/.codex/image2-mcp.env."
+  );
+  try {
+    const outputDir = ensureOutputDir();
+    const probe = path2.join(outputDir, `.image2-doctor-${randomUUID2()}.tmp`);
+    fs2.writeFileSync(probe, "ok", { flag: "wx" });
+    fs2.unlinkSync(probe);
+    addCheck("output_directory", "pass", `Output directory is writable: ${outputDir}`);
+  } catch (error2) {
+    addCheck("output_directory", "fail", `Output directory is not writable: ${error2.message}`);
+  }
+  let requestId = null;
+  let clientRequestId = null;
+  if (!args.network) {
+    addCheck("api", "warn", "Network checks were skipped by request.");
+  } else if (!apiKey) {
+    addCheck("api", "warn", "API checks were skipped because IMAGE2_API_KEY is missing.");
+  } else {
+    try {
+      const result = await requestApiJson({
+        endpoint: `${baseUrl}/models`,
+        method: "GET",
+        headers: authHeaders(),
+        timeoutMs: 15e3,
+        secret: apiKey
+      });
+      requestId = result.request_id;
+      clientRequestId = result.client_request_id;
+      const models = Array.isArray(result.json?.data) ? result.json.data.map((item) => item?.id).filter(Boolean) : null;
+      if (!models) {
+        addCheck("api", "warn", "The models endpoint responded but did not return a model list.");
+      } else if (models.includes(defaultModel)) {
+        addCheck("api", "pass", `Model ${defaultModel} is visible to this API key.`);
+      } else {
+        addCheck("api", "fail", `Model ${defaultModel} is not visible to this API key.`);
+      }
+    } catch (error2) {
+      const publicError = toPublicError(error2);
+      requestId = publicError.request_id;
+      clientRequestId = publicError.client_request_id;
+      if ([404, 405, 501].includes(publicError.status)) {
+        addCheck("api", "warn", "The provider does not support the models endpoint; generation was not attempted.");
+      } else {
+        addCheck("api", "fail", `${publicError.code}: ${publicError.message}`);
+      }
+    }
+  }
+  const status = checks.some((check2) => check2.status === "fail") ? "fail" : checks.some((check2) => check2.status === "warn") ? "warn" : "pass";
+  return {
+    status,
+    checks,
+    base_url: safeEndpoint(baseUrl),
+    model: defaultModel,
+    request_id: requestId,
+    client_request_id: clientRequestId
   };
 }
 async function extractDesignElements(args, signal) {
@@ -21434,27 +22308,37 @@ async function editImages(args, signal) {
     }
   }
   for (const input of preparedInputs) {
-    form.append("image", await fileBlob(input.path), path.basename(input.path));
+    form.append("image", await fileBlob(input.path), path2.basename(input.path));
   }
   if (args.mask_path) {
     const mask = await prepareInputImage(args.mask_path, { ...args, preserve_alpha: true });
-    form.append("mask", await fileBlob(mask.path), path.basename(mask.path));
+    form.append("mask", await fileBlob(mask.path), path2.basename(mask.path));
   }
-  const response = await fetch(endpoint, {
-    method: "POST",
+  const apiResult = await requestApiJson({
+    endpoint,
     headers: authHeaders(),
     body: form,
-    signal
+    signal,
+    timeoutMs: requestTimeoutMs,
+    secret: apiKey
   });
-  const json = await parseJsonResponse(response);
-  const saved = saveImagesFromResponse(json, outputDir, args.filename_prefix, args.output_format);
+  const saved = await persistImagesFromResponse(apiResult.json, transportOptions({
+    outputDir,
+    prefix: args.filename_prefix,
+    outputFormat: args.output_format,
+    signal,
+    requestId: apiResult.request_id,
+    clientRequestId: apiResult.client_request_id
+  }));
   return {
     mode: "edit",
     endpoint,
     model: request.model,
     input_context: inputReportForResult(preparedInputs),
     images: saved,
-    raw_usage: json.usage || null
+    raw_usage: apiResult.json.usage || null,
+    request_id: apiResult.request_id,
+    client_request_id: apiResult.client_request_id
   };
 }
 function buildJsonRequest(args) {
@@ -21548,158 +22432,6 @@ function validateImageArgs(args) {
     throw new Error("partial_images must be between 0 and 3.");
   }
 }
-async function requestJson(endpoint, request, signal) {
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      ...authHeaders(),
-      "content-type": "application/json"
-    },
-    body: JSON.stringify(request),
-    signal
-  });
-  return parseJsonResponse(response);
-}
-async function requestImageStream(endpoint, request, outputDir, prefix, outputFormat, signal) {
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      ...authHeaders(),
-      "content-type": "application/json"
-    },
-    body: JSON.stringify(request),
-    signal
-  });
-  if (!response.ok) {
-    await parseJsonResponse(response);
-  }
-  if (!response.body) {
-    throw new Error("Streaming response body is empty.");
-  }
-  const decoder = new TextDecoder();
-  const reader = response.body.getReader();
-  let buffer = "";
-  const partials = [];
-  const finals = [];
-  let rawUsage = null;
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const chunks = buffer.split("\n\n");
-    buffer = chunks.pop() || "";
-    for (const chunk of chunks) {
-      const event = parseSseChunk(chunk);
-      if (!event || event.data === "[DONE]") continue;
-      let payload;
-      try {
-        payload = JSON.parse(event.data);
-      } catch {
-        continue;
-      }
-      const b64 = findBase64Image(payload);
-      if (!b64) {
-        if (payload.usage) rawUsage = payload.usage;
-        continue;
-      }
-      const kind = isPartialEvent(event.event, payload) ? "partial" : "final";
-      const saved = saveBase64Image(b64, outputDir, prefix, outputFormat, kind);
-      if (kind === "partial") partials.push(saved);
-      else finals.push(saved);
-      if (payload.usage) rawUsage = payload.usage;
-    }
-  }
-  return {
-    partial_images: partials,
-    images: finals.length ? finals : partials.slice(-1),
-    raw_usage: rawUsage
-  };
-}
-function parseSseChunk(chunk) {
-  const lines = chunk.split(/\r?\n/);
-  const event = { event: null, data: "" };
-  for (const line of lines) {
-    if (line.startsWith("event:")) event.event = line.slice(6).trim();
-    if (line.startsWith("data:")) event.data += line.slice(5).trim();
-  }
-  return event.data ? event : null;
-}
-function isPartialEvent(eventName, payload) {
-  const name = `${eventName || ""} ${payload.type || ""}`.toLowerCase();
-  return name.includes("partial");
-}
-function saveImagesFromResponse(json, outputDir, prefix, outputFormat) {
-  const data = Array.isArray(json.data) ? json.data : [];
-  const saved = [];
-  for (const item of data) {
-    const b64 = item.b64_json || item.image || item.data;
-    if (b64) {
-      saved.push(saveBase64Image(b64, outputDir, prefix, outputFormat, "final"));
-    } else if (item.url) {
-      saved.push({ url: item.url });
-    }
-  }
-  if (!saved.length) {
-    const b64 = findBase64Image(json);
-    if (b64) saved.push(saveBase64Image(b64, outputDir, prefix, outputFormat, "final"));
-  }
-  return saved;
-}
-function findBase64Image(value) {
-  if (!value || typeof value !== "object") return null;
-  if (typeof value.b64_json === "string") return value.b64_json;
-  if (typeof value.image === "string" && looksLikeBase64(value.image)) return value.image;
-  if (typeof value.data === "string" && looksLikeBase64(value.data)) return value.data;
-  for (const child of Object.values(value)) {
-    if (Array.isArray(child)) {
-      for (const item of child) {
-        const found = findBase64Image(item);
-        if (found) return found;
-      }
-    } else if (child && typeof child === "object") {
-      const found = findBase64Image(child);
-      if (found) return found;
-    }
-  }
-  return null;
-}
-function looksLikeBase64(text) {
-  return text.length > 100 && /^[A-Za-z0-9+/=_-]+$/.test(text);
-}
-function saveBase64Image(b64, outputDir, prefix, outputFormat, kind) {
-  const safePrefix = String(prefix || "image2").replace(/[^a-zA-Z0-9._-]/g, "_");
-  const filename = `${safePrefix}-${kind}-${Date.now()}-${randomUUID().slice(0, 8)}.${outputFormat}`;
-  const filePath = path.join(outputDir, filename);
-  fs.writeFileSync(filePath, Buffer.from(stripDataUrl(b64), "base64"));
-  return {
-    path: filePath,
-    kind,
-    format: outputFormat,
-    bytes: fs.statSync(filePath).size
-  };
-}
-function stripDataUrl(b64) {
-  const comma = b64.indexOf(",");
-  if (b64.startsWith("data:") && comma !== -1) return b64.slice(comma + 1);
-  return b64;
-}
-async function parseJsonResponse(response) {
-  const text = await response.text();
-  let json = null;
-  try {
-    json = text ? JSON.parse(text) : {};
-  } catch {
-    json = { raw: text };
-  }
-  if (!response.ok) {
-    const message = json?.error?.message || json?.message || text || `${response.status} ${response.statusText}`;
-    const error2 = new Error(message);
-    error2.status = response.status;
-    error2.response = json;
-    throw error2;
-  }
-  return json;
-}
 async function prepareInputImages(args) {
   const paths = resolveInputImagePaths(args);
   if (!paths.length) {
@@ -21735,7 +22467,7 @@ function resolveInputImagePaths(args) {
 }
 async function prepareInputImage(imagePath, args = {}) {
   const resolved = expandHome(imagePath);
-  if (!fs.existsSync(resolved)) {
+  if (!fs2.existsSync(resolved)) {
     throw new Error(`Input image does not exist: ${resolved}`);
   }
   const original = imageMetadata(resolved);
@@ -21761,11 +22493,11 @@ async function prepareInputImage(imagePath, args = {}) {
   const sourceHash = hashFile(resolved).slice(0, 16);
   const keepAlpha = hasAlpha && args.preserve_alpha !== false;
   const targetFormat = keepAlpha ? "png" : "jpeg";
-  const outputPath = path.join(
+  const outputPath = path2.join(
     INPUT_CACHE_DIR,
-    `${path.basename(resolved, path.extname(resolved)).replace(/[^a-zA-Z0-9._-]/g, "_")}-${sourceHash}-${maxLongEdge}-${quality}.${targetFormat === "jpeg" ? "jpg" : "png"}`
+    `${path2.basename(resolved, path2.extname(resolved)).replace(/[^a-zA-Z0-9._-]/g, "_")}-${sourceHash}-${maxLongEdge}-${quality}.${targetFormat === "jpeg" ? "jpg" : "png"}`
   );
-  if (!fs.existsSync(outputPath)) {
+  if (!fs2.existsSync(outputPath)) {
     const command = targetFormat === "jpeg" ? ["-s", "format", "jpeg", "-s", "formatOptions", String(quality), "-Z", String(maxLongEdge), resolved, "--out", outputPath] : ["-s", "format", "png", "-Z", String(maxLongEdge), resolved, "--out", outputPath];
     try {
       execFileSync("sips", command, { stdio: "ignore" });
@@ -21801,7 +22533,7 @@ function enforceInputBudget(inputs, maxInputBytes) {
   const total = inputs.reduce((sum, input) => sum + input.bytes, 0);
   if (total <= maxInputBytes) return;
   const mb = (value) => `${(value / 1024 / 1024).toFixed(2)}MB`;
-  const lines = inputs.map((input) => `${path.basename(input.original_path)}: ${mb(input.original_bytes)} -> ${mb(input.bytes)}`);
+  const lines = inputs.map((input) => `${path2.basename(input.original_path)}: ${mb(input.original_bytes)} -> ${mb(input.bytes)}`);
   throw new Error(`Prepared Image2 input images are ${mb(total)}, over max_input_bytes ${mb(maxInputBytes)}. Lower max_input_long_edge, reduce reference image count, or register only the current target image. ${lines.join("; ")}`);
 }
 function inputReportForResult(inputs) {
@@ -21814,8 +22546,8 @@ function inputReportForResult(inputs) {
     saved_bytes: Math.max(0, totalOriginalBytes - totalPreparedBytes),
     max_long_edge: Math.max(0, ...inputs.map((input) => Math.max(input.width || 0, input.height || 0))),
     prepared_images: inputs.map((input) => ({
-      filename: path.basename(input.path),
-      original_filename: path.basename(input.original_path),
+      filename: path2.basename(input.path),
+      original_filename: path2.basename(input.original_path),
       bytes: input.bytes,
       original_bytes: input.original_bytes,
       width: input.width,
@@ -21827,12 +22559,12 @@ function inputReportForResult(inputs) {
 }
 async function fileBlob(filePath) {
   const resolved = expandHome(filePath);
-  const bytes = fs.readFileSync(resolved);
-  return new Blob([bytes]);
+  const bytes = fs2.readFileSync(resolved);
+  return new Blob([bytes], { type: mimeTypeForPath(resolved) });
 }
 function registerImageAsset(args) {
   const resolved = expandHome(args.image_path);
-  if (!fs.existsSync(resolved)) {
+  if (!fs2.existsSync(resolved)) {
     throw new Error(`Input image does not exist: ${resolved}`);
   }
   const meta = imageMetadata(resolved);
@@ -21844,7 +22576,7 @@ function registerImageAsset(args) {
   registeredAssets.assets[assetId] = {
     id: assetId,
     path: resolved,
-    name: args.name || existing?.name || path.basename(resolved),
+    name: args.name || existing?.name || path2.basename(resolved),
     description: args.description || existing?.description || "",
     tags: args.tags || existing?.tags || [],
     hash,
@@ -21880,8 +22612,8 @@ function publicAsset(asset) {
   };
 }
 function imageMetadata(filePath) {
-  const ext = path.extname(filePath).toLowerCase();
-  const stat = fs.statSync(filePath);
+  const ext = path2.extname(filePath).toLowerCase();
+  const stat = fs2.statSync(filePath);
   const output = runSips(["-g", "pixelWidth", "-g", "pixelHeight", "-g", "hasAlpha", filePath]);
   const width = numberFromSips(output, "pixelWidth") || 0;
   const height = numberFromSips(output, "pixelHeight") || 0;
@@ -21909,14 +22641,19 @@ function numberFromSips(output, key) {
 }
 function hashFile(filePath) {
   const hash = createHash("sha256");
-  hash.update(fs.readFileSync(filePath));
+  hash.update(fs2.readFileSync(filePath));
   return hash.digest("hex");
 }
 function authHeaders() {
   return { authorization: `Bearer ${apiKey}` };
 }
 function assertConfigured() {
-  if (!apiKey) throw new Error("IMAGE2_API_KEY is not configured. Set it in ~/.codex/image2-mcp.env.");
+  if (!apiKey) {
+    throw new Image2Error("IMAGE2_API_KEY is not configured. Set it in ~/.codex/image2-mcp.env.", {
+      code: "CONFIG_ERROR",
+      stage: "configuration"
+    });
+  }
 }
 function normalizeBaseUrl(url) {
   const trimmed = url.replace(/\/+$/, "");
@@ -21924,18 +22661,18 @@ function normalizeBaseUrl(url) {
 }
 function ensureOutputDir(outputDir) {
   const resolved = expandHome(outputDir || defaultOutputDir);
-  fs.mkdirSync(resolved, { recursive: true });
+  fs2.mkdirSync(resolved, { recursive: true });
   return resolved;
 }
 function expandHome(value) {
   if (!value) return value;
   if (value === "~") return os.homedir();
-  if (value.startsWith("~/")) return path.join(os.homedir(), value.slice(2));
+  if (value.startsWith("~/")) return path2.join(os.homedir(), value.slice(2));
   return value;
 }
 function loadEnvFile(filePath) {
-  if (!fs.existsSync(filePath)) return;
-  const lines = fs.readFileSync(filePath, "utf8").split(/\r?\n/);
+  if (!fs2.existsSync(filePath)) return;
+  const lines = fs2.readFileSync(filePath, "utf8").split(/\r?\n/);
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
@@ -21947,10 +22684,29 @@ function loadEnvFile(filePath) {
     if (!process.env[key]) process.env[key] = value;
   }
 }
+function positiveIntegerEnv(name, fallback) {
+  const value = Number(process.env[name]);
+  return Number.isInteger(value) && value > 0 ? value : fallback;
+}
+function transportOptions({ outputDir, prefix, outputFormat, signal, requestId, clientRequestId, lifecycle, endpoint }) {
+  return {
+    outputDir,
+    prefix,
+    outputFormat,
+    signal,
+    requestId,
+    clientRequestId,
+    lifecycle,
+    endpoint,
+    baseUrl,
+    downloadTimeoutMs,
+    maxOutputBytes
+  };
+}
 function loadAssetRegistry() {
-  if (!fs.existsSync(ASSETS_FILE)) return { version: 1, assets: {} };
+  if (!fs2.existsSync(ASSETS_FILE)) return { version: 1, assets: {} };
   try {
-    const parsed = JSON.parse(fs.readFileSync(ASSETS_FILE, "utf8"));
+    const parsed = JSON.parse(fs2.readFileSync(ASSETS_FILE, "utf8"));
     return {
       version: 1,
       assets: parsed.assets && typeof parsed.assets === "object" ? parsed.assets : {}
@@ -21960,7 +22716,7 @@ function loadAssetRegistry() {
   }
 }
 function saveAssetRegistry() {
-  fs.writeFileSync(ASSETS_FILE, JSON.stringify(registeredAssets, null, 2));
+  fs2.writeFileSync(ASSETS_FILE, JSON.stringify(registeredAssets, null, 2));
 }
 function updateJob(jobId, patch) {
   const record2 = jobs.get(jobId);
@@ -21969,13 +22725,13 @@ function updateJob(jobId, patch) {
   writeJob(record2);
 }
 function writeJob(record2) {
-  const file = path.join(JOBS_DIR, `${record2.job_id}.json`);
-  fs.writeFileSync(file, JSON.stringify(publicJob(record2), null, 2));
+  const file = path2.join(JOBS_DIR, `${record2.job_id}.json`);
+  fs2.writeFileSync(file, JSON.stringify(publicJob(record2), null, 2));
 }
 function readJob(jobId) {
-  const file = path.join(JOBS_DIR, `${jobId}.json`);
-  if (!fs.existsSync(file)) return null;
-  return JSON.parse(fs.readFileSync(file, "utf8"));
+  const file = path2.join(JOBS_DIR, `${jobId}.json`);
+  if (!fs2.existsSync(file)) return null;
+  return JSON.parse(fs2.readFileSync(file, "utf8"));
 }
 function publicJob(record2) {
   if (!record2) return null;
@@ -21994,15 +22750,18 @@ function sanitizeForRecord(args) {
   }
   return copy;
 }
-function errorToJson(error2) {
-  return {
-    message: error2.message,
-    status: error2.status || null,
-    response: error2.response || null
+function withToolErrors(handler) {
+  return async (...args) => {
+    try {
+      return await handler(...args);
+    } catch (error2) {
+      return jsonToolResult(toolErrorPayload(error2), true);
+    }
   };
 }
-function jsonToolResult(value) {
+function jsonToolResult(value, isError = false) {
   return {
+    ...isError ? { isError: true } : {},
     content: [
       {
         type: "text",

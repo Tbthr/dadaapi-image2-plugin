@@ -8,6 +8,18 @@ import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import {
+  Image2Error,
+  consumeImageStream,
+  mimeTypeForPath,
+  parseApiJsonResponse,
+  persistImagesFromResponse,
+  requestApiJson,
+  requestApiResponse,
+  safeEndpoint,
+  toPublicError,
+  toolErrorPayload
+} from "./lib/image-transport.js";
 
 const SERVER_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_OUTPUT_DIR = path.join(SERVER_ROOT, "assets");
@@ -34,8 +46,10 @@ const apiKey = process.env.IMAGE2_API_KEY;
 const baseUrl = normalizeBaseUrl(process.env.IMAGE2_BASE_URL || "https://dadaapi.com");
 const defaultModel = process.env.IMAGE2_MODEL || "gpt-image-2";
 const defaultOutputDir = expandHome(process.env.IMAGE2_DEFAULT_OUTPUT_DIR || DEFAULT_OUTPUT_DIR);
+const requestTimeoutMs = positiveIntegerEnv("IMAGE2_REQUEST_TIMEOUT_MS", 300000);
+const downloadTimeoutMs = positiveIntegerEnv("IMAGE2_DOWNLOAD_TIMEOUT_MS", 60000);
+const maxOutputBytes = positiveIntegerEnv("IMAGE2_MAX_OUTPUT_BYTES", 32 * 1024 * 1024);
 
-fs.mkdirSync(defaultOutputDir, { recursive: true });
 fs.mkdirSync(JOBS_DIR, { recursive: true });
 fs.mkdirSync(INPUT_CACHE_DIR, { recursive: true });
 
@@ -122,6 +136,10 @@ const cancelJobSchema = z.object({
   job_id: z.string().min(1).describe("Job id returned by image2_start_generation.")
 });
 
+const doctorSchema = z.object({
+  network: z.boolean().default(true).describe("Also check API connectivity and model visibility without generating an image.")
+});
+
 const server = new McpServer({
   name: "DadaAPI Image2",
   version: "0.1.0"
@@ -131,47 +149,54 @@ server.tool(
   "image2_generate",
   "Generate GPT Image compatible assets and save them to disk. Supports optional streaming partial images.",
   generateSchema.shape,
-  async (args) => {
+  withToolErrors(async (args) => {
     const result = await generateImages(args);
     return jsonToolResult(result);
-  }
+  })
 );
 
 server.tool(
   "image2_edit",
   "Edit one or more images with a GPT Image compatible API and save the outputs to disk. GPT Image2 does not support transparent backgrounds, alpha output, or transparent PNG generation.",
   editSchema.shape,
-  async (args) => {
+  withToolErrors(async (args) => {
     const result = await editImages(args);
     return jsonToolResult(result);
-  }
+  })
+);
+
+server.tool(
+  "image2_doctor",
+  "Check Image2 configuration, output directory access, API connectivity, and model visibility without generating an image.",
+  doctorSchema.shape,
+  withToolErrors(async (args) => jsonToolResult(await runDoctor(args)))
 );
 
 server.tool(
   "image2_register_asset",
   "Register a local image as a reusable lightweight Image2 asset. Future edits can pass image_asset_ids instead of repeating historical image context.",
   registerAssetSchema.shape,
-  async (args) => {
+  withToolErrors(async (args) => {
     const result = registerImageAsset(args);
     return jsonToolResult(result);
-  }
+  })
 );
 
 server.tool(
   "image2_extract_elements",
   "Use Image2 image editing to isolate or recreate described subjects/elements from a source image as opaque PNG/WebP assets. GPT Image2 does not support transparent backgrounds, alpha output, or transparent PNG generation.",
   extractElementsSchema.shape,
-  async (args) => {
+  withToolErrors(async (args) => {
     const result = await extractDesignElements(args);
     return jsonToolResult(result);
-  }
+  })
 );
 
 server.tool(
   "image2_start_generation",
   "Start a background image generation job. Use image2_get_job to poll status later.",
   startSchema.shape,
-  async (args) => {
+  withToolErrors(async (args) => {
     const jobId = randomUUID();
     const controller = new AbortController();
     const now = new Date().toISOString();
@@ -195,9 +220,13 @@ server.tool(
         updateJob(jobId, { status: "completed", result });
       })
       .catch((error) => {
+        const publicError = toPublicError(error);
         updateJob(jobId, {
           status: controller.signal.aborted ? "cancelled" : "failed",
-          error: errorToJson(error)
+          error: publicError,
+          ...(Array.isArray(error?.partialImages) && error.partialImages.length
+            ? { partial_images: error.partialImages }
+            : {})
         });
       });
 
@@ -206,27 +235,27 @@ server.tool(
       status: "running",
       message: "Generation started. Poll with image2_get_job."
     });
-  }
+  })
 );
 
 server.tool(
   "image2_get_job",
   "Get the current state and saved output paths for a background image generation job.",
   getJobSchema.shape,
-  async ({ job_id }) => {
+  withToolErrors(async ({ job_id }) => {
     const record = jobs.get(job_id) || readJob(job_id);
     if (!record) {
       throw new Error(`Unknown job_id: ${job_id}`);
     }
     return jsonToolResult(publicJob(record));
-  }
+  })
 );
 
 server.tool(
   "image2_cancel_job",
   "Cancel a running background image generation job.",
   cancelJobSchema.shape,
-  async ({ job_id }) => {
+  withToolErrors(async ({ job_id }) => {
     const record = jobs.get(job_id);
     if (!record) {
       const saved = readJob(job_id);
@@ -238,7 +267,7 @@ server.tool(
       updateJob(job_id, { status: "cancelled" });
     }
     return jsonToolResult(publicJob(jobs.get(job_id)));
-  }
+  })
 );
 
 if (!apiKey) {
@@ -254,25 +283,154 @@ async function generateImages(args, signal) {
   const endpoint = `${baseUrl}/images/generations`;
 
   if (args.stream) {
-    const streamResult = await requestImageStream(endpoint, request, outputDir, args.filename_prefix, args.output_format, signal);
-    return {
-      mode: "generation",
+    const apiResult = await requestApiResponse({
       endpoint,
-      model: request.model,
-      stream: true,
-      ...streamResult
-    };
+      headers: {
+        ...authHeaders(),
+        "content-type": "application/json"
+      },
+      body: JSON.stringify(request),
+      signal,
+      timeoutMs: requestTimeoutMs
+    });
+    try {
+      if (!apiResult.response.ok) {
+        await parseApiJsonResponse(apiResult.response, {
+          requestId: apiResult.request_id,
+          clientRequestId: apiResult.client_request_id,
+          secret: apiKey,
+          lifecycle: apiResult.lifecycle
+        });
+      }
+      const streamResult = await consumeImageStream(apiResult.response, transportOptions({
+        outputDir,
+        prefix: args.filename_prefix,
+        outputFormat: args.output_format,
+        signal,
+        requestId: apiResult.request_id,
+        clientRequestId: apiResult.client_request_id,
+        lifecycle: apiResult.lifecycle,
+        endpoint
+      }));
+      return {
+        mode: "generation",
+        endpoint,
+        model: request.model,
+        stream: true,
+        ...streamResult
+      };
+    } finally {
+      apiResult.lifecycle.cleanup();
+    }
   }
 
-  const json = await requestJson(endpoint, request, signal);
-  const saved = saveImagesFromResponse(json, outputDir, args.filename_prefix, args.output_format);
+  const apiResult = await requestApiJson({
+    endpoint,
+    headers: {
+      ...authHeaders(),
+      "content-type": "application/json"
+    },
+    body: JSON.stringify(request),
+    signal,
+    timeoutMs: requestTimeoutMs,
+    secret: apiKey
+  });
+  const saved = await persistImagesFromResponse(apiResult.json, transportOptions({
+    outputDir,
+    prefix: args.filename_prefix,
+    outputFormat: args.output_format,
+    signal,
+    requestId: apiResult.request_id,
+    clientRequestId: apiResult.client_request_id
+  }));
   return {
     mode: "generation",
     endpoint,
     model: request.model,
     stream: false,
     images: saved,
-    raw_usage: json.usage || null
+    raw_usage: apiResult.json.usage || null,
+    request_id: apiResult.request_id,
+    client_request_id: apiResult.client_request_id
+  };
+}
+
+async function runDoctor(args) {
+  const checks = [];
+  const addCheck = (name, status, message) => checks.push({ name, status, message });
+  const nodeMajor = Number(process.versions.node.split(".")[0]);
+  addCheck(
+    "node",
+    nodeMajor >= 20 ? "pass" : "fail",
+    `Node ${process.versions.node}; version 20 or newer is required.`
+  );
+  addCheck(
+    "configuration",
+    apiKey ? "pass" : "fail",
+    apiKey ? "IMAGE2_API_KEY is configured." : "IMAGE2_API_KEY is not configured in ~/.codex/image2-mcp.env."
+  );
+
+  try {
+    const outputDir = ensureOutputDir();
+    const probe = path.join(outputDir, `.image2-doctor-${randomUUID()}.tmp`);
+    fs.writeFileSync(probe, "ok", { flag: "wx" });
+    fs.unlinkSync(probe);
+    addCheck("output_directory", "pass", `Output directory is writable: ${outputDir}`);
+  } catch (error) {
+    addCheck("output_directory", "fail", `Output directory is not writable: ${error.message}`);
+  }
+
+  let requestId = null;
+  let clientRequestId = null;
+  if (!args.network) {
+    addCheck("api", "warn", "Network checks were skipped by request.");
+  } else if (!apiKey) {
+    addCheck("api", "warn", "API checks were skipped because IMAGE2_API_KEY is missing.");
+  } else {
+    try {
+      const result = await requestApiJson({
+        endpoint: `${baseUrl}/models`,
+        method: "GET",
+        headers: authHeaders(),
+        timeoutMs: 15000,
+        secret: apiKey
+      });
+      requestId = result.request_id;
+      clientRequestId = result.client_request_id;
+      const models = Array.isArray(result.json?.data)
+        ? result.json.data.map((item) => item?.id).filter(Boolean)
+        : null;
+      if (!models) {
+        addCheck("api", "warn", "The models endpoint responded but did not return a model list.");
+      } else if (models.includes(defaultModel)) {
+        addCheck("api", "pass", `Model ${defaultModel} is visible to this API key.`);
+      } else {
+        addCheck("api", "fail", `Model ${defaultModel} is not visible to this API key.`);
+      }
+    } catch (error) {
+      const publicError = toPublicError(error);
+      requestId = publicError.request_id;
+      clientRequestId = publicError.client_request_id;
+      if ([404, 405, 501].includes(publicError.status)) {
+        addCheck("api", "warn", "The provider does not support the models endpoint; generation was not attempted.");
+      } else {
+        addCheck("api", "fail", `${publicError.code}: ${publicError.message}`);
+      }
+    }
+  }
+
+  const status = checks.some((check) => check.status === "fail")
+    ? "fail"
+    : checks.some((check) => check.status === "warn")
+      ? "warn"
+      : "pass";
+  return {
+    status,
+    checks,
+    base_url: safeEndpoint(baseUrl),
+    model: defaultModel,
+    request_id: requestId,
+    client_request_id: clientRequestId
   };
 }
 
@@ -384,21 +542,31 @@ async function editImages(args, signal) {
     form.append("mask", await fileBlob(mask.path), path.basename(mask.path));
   }
 
-  const response = await fetch(endpoint, {
-    method: "POST",
+  const apiResult = await requestApiJson({
+    endpoint,
     headers: authHeaders(),
     body: form,
-    signal
+    signal,
+    timeoutMs: requestTimeoutMs,
+    secret: apiKey
   });
-  const json = await parseJsonResponse(response);
-  const saved = saveImagesFromResponse(json, outputDir, args.filename_prefix, args.output_format);
+  const saved = await persistImagesFromResponse(apiResult.json, transportOptions({
+    outputDir,
+    prefix: args.filename_prefix,
+    outputFormat: args.output_format,
+    signal,
+    requestId: apiResult.request_id,
+    clientRequestId: apiResult.client_request_id
+  }));
   return {
     mode: "edit",
     endpoint,
     model: request.model,
     input_context: inputReportForResult(preparedInputs),
     images: saved,
-    raw_usage: json.usage || null
+    raw_usage: apiResult.json.usage || null,
+    request_id: apiResult.request_id,
+    client_request_id: apiResult.client_request_id
   };
 }
 
@@ -504,175 +672,6 @@ function validateImageArgs(args) {
   if (args.partial_images > MAX_PARTIAL_IMAGES) {
     throw new Error("partial_images must be between 0 and 3.");
   }
-}
-
-async function requestJson(endpoint, request, signal) {
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      ...authHeaders(),
-      "content-type": "application/json"
-    },
-    body: JSON.stringify(request),
-    signal
-  });
-  return parseJsonResponse(response);
-}
-
-async function requestImageStream(endpoint, request, outputDir, prefix, outputFormat, signal) {
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      ...authHeaders(),
-      "content-type": "application/json"
-    },
-    body: JSON.stringify(request),
-    signal
-  });
-
-  if (!response.ok) {
-    await parseJsonResponse(response);
-  }
-  if (!response.body) {
-    throw new Error("Streaming response body is empty.");
-  }
-
-  const decoder = new TextDecoder();
-  const reader = response.body.getReader();
-  let buffer = "";
-  const partials = [];
-  const finals = [];
-  let rawUsage = null;
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const chunks = buffer.split("\n\n");
-    buffer = chunks.pop() || "";
-
-    for (const chunk of chunks) {
-      const event = parseSseChunk(chunk);
-      if (!event || event.data === "[DONE]") continue;
-      let payload;
-      try {
-        payload = JSON.parse(event.data);
-      } catch {
-        continue;
-      }
-
-      const b64 = findBase64Image(payload);
-      if (!b64) {
-        if (payload.usage) rawUsage = payload.usage;
-        continue;
-      }
-
-      const kind = isPartialEvent(event.event, payload) ? "partial" : "final";
-      const saved = saveBase64Image(b64, outputDir, prefix, outputFormat, kind);
-      if (kind === "partial") partials.push(saved);
-      else finals.push(saved);
-      if (payload.usage) rawUsage = payload.usage;
-    }
-  }
-
-  return {
-    partial_images: partials,
-    images: finals.length ? finals : partials.slice(-1),
-    raw_usage: rawUsage
-  };
-}
-
-function parseSseChunk(chunk) {
-  const lines = chunk.split(/\r?\n/);
-  const event = { event: null, data: "" };
-  for (const line of lines) {
-    if (line.startsWith("event:")) event.event = line.slice(6).trim();
-    if (line.startsWith("data:")) event.data += line.slice(5).trim();
-  }
-  return event.data ? event : null;
-}
-
-function isPartialEvent(eventName, payload) {
-  const name = `${eventName || ""} ${payload.type || ""}`.toLowerCase();
-  return name.includes("partial");
-}
-
-function saveImagesFromResponse(json, outputDir, prefix, outputFormat) {
-  const data = Array.isArray(json.data) ? json.data : [];
-  const saved = [];
-  for (const item of data) {
-    const b64 = item.b64_json || item.image || item.data;
-    if (b64) {
-      saved.push(saveBase64Image(b64, outputDir, prefix, outputFormat, "final"));
-    } else if (item.url) {
-      saved.push({ url: item.url });
-    }
-  }
-  if (!saved.length) {
-    const b64 = findBase64Image(json);
-    if (b64) saved.push(saveBase64Image(b64, outputDir, prefix, outputFormat, "final"));
-  }
-  return saved;
-}
-
-function findBase64Image(value) {
-  if (!value || typeof value !== "object") return null;
-  if (typeof value.b64_json === "string") return value.b64_json;
-  if (typeof value.image === "string" && looksLikeBase64(value.image)) return value.image;
-  if (typeof value.data === "string" && looksLikeBase64(value.data)) return value.data;
-  for (const child of Object.values(value)) {
-    if (Array.isArray(child)) {
-      for (const item of child) {
-        const found = findBase64Image(item);
-        if (found) return found;
-      }
-    } else if (child && typeof child === "object") {
-      const found = findBase64Image(child);
-      if (found) return found;
-    }
-  }
-  return null;
-}
-
-function looksLikeBase64(text) {
-  return text.length > 100 && /^[A-Za-z0-9+/=_-]+$/.test(text);
-}
-
-function saveBase64Image(b64, outputDir, prefix, outputFormat, kind) {
-  const safePrefix = String(prefix || "image2").replace(/[^a-zA-Z0-9._-]/g, "_");
-  const filename = `${safePrefix}-${kind}-${Date.now()}-${randomUUID().slice(0, 8)}.${outputFormat}`;
-  const filePath = path.join(outputDir, filename);
-  fs.writeFileSync(filePath, Buffer.from(stripDataUrl(b64), "base64"));
-  return {
-    path: filePath,
-    kind,
-    format: outputFormat,
-    bytes: fs.statSync(filePath).size
-  };
-}
-
-function stripDataUrl(b64) {
-  const comma = b64.indexOf(",");
-  if (b64.startsWith("data:") && comma !== -1) return b64.slice(comma + 1);
-  return b64;
-}
-
-async function parseJsonResponse(response) {
-  const text = await response.text();
-  let json = null;
-  try {
-    json = text ? JSON.parse(text) : {};
-  } catch {
-    json = { raw: text };
-  }
-  if (!response.ok) {
-    const message = json?.error?.message || json?.message || text || `${response.status} ${response.statusText}`;
-    const error = new Error(message);
-    error.status = response.status;
-    error.response = json;
-    throw error;
-  }
-  return json;
 }
 
 async function prepareInputImages(args) {
@@ -819,7 +818,7 @@ function inputReportForResult(inputs) {
 async function fileBlob(filePath) {
   const resolved = expandHome(filePath);
   const bytes = fs.readFileSync(resolved);
-  return new Blob([bytes]);
+  return new Blob([bytes], { type: mimeTypeForPath(resolved) });
 }
 
 function registerImageAsset(args) {
@@ -915,7 +914,12 @@ function authHeaders() {
 }
 
 function assertConfigured() {
-  if (!apiKey) throw new Error("IMAGE2_API_KEY is not configured. Set it in ~/.codex/image2-mcp.env.");
+  if (!apiKey) {
+    throw new Image2Error("IMAGE2_API_KEY is not configured. Set it in ~/.codex/image2-mcp.env.", {
+      code: "CONFIG_ERROR",
+      stage: "configuration"
+    });
+  }
 }
 
 function normalizeBaseUrl(url) {
@@ -949,6 +953,27 @@ function loadEnvFile(filePath) {
     value = value.replace(/^['"]|['"]$/g, "");
     if (!process.env[key]) process.env[key] = value;
   }
+}
+
+function positiveIntegerEnv(name, fallback) {
+  const value = Number(process.env[name]);
+  return Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
+function transportOptions({ outputDir, prefix, outputFormat, signal, requestId, clientRequestId, lifecycle, endpoint }) {
+  return {
+    outputDir,
+    prefix,
+    outputFormat,
+    signal,
+    requestId,
+    clientRequestId,
+    lifecycle,
+    endpoint,
+    baseUrl,
+    downloadTimeoutMs,
+    maxOutputBytes
+  };
 }
 
 function loadAssetRegistry() {
@@ -1005,16 +1030,19 @@ function sanitizeForRecord(args) {
   return copy;
 }
 
-function errorToJson(error) {
-  return {
-    message: error.message,
-    status: error.status || null,
-    response: error.response || null
+function withToolErrors(handler) {
+  return async (...args) => {
+    try {
+      return await handler(...args);
+    } catch (error) {
+      return jsonToolResult(toolErrorPayload(error), true);
+    }
   };
 }
 
-function jsonToolResult(value) {
+function jsonToolResult(value, isError = false) {
   return {
+    ...(isError ? { isError: true } : {}),
     content: [
       {
         type: "text",

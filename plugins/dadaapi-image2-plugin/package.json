@@ -10,7 +10,8 @@
   },
   "scripts": {
     "build": "esbuild server.js --bundle --platform=node --target=node20 --format=esm --outfile=dist/server.js",
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test"
   },
   "keywords": [
     "mcp",
