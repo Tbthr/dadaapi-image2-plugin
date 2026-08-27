@@ -21113,6 +21113,8 @@ var DEFAULT_MAX_OUTPUT_BYTES = 32 * 1024 * 1024;
 var ERROR_BODY_LIMIT = 2048;
 var DOWNLOAD_RETRY_DELAY_MS = 500;
 var DOWNLOAD_RETRY_AFTER_CAP_MS = 5e3;
+var RESPONSE_SNIFF_BYTES = 4096;
+var MAX_STREAM_EVENTS = 1e3;
 var Image2Error = class extends Error {
   constructor(message, options = {}) {
     super(message, options.cause ? { cause: options.cause } : void 0);
@@ -21121,6 +21123,7 @@ var Image2Error = class extends Error {
     this.stage = options.stage || "plugin";
     this.status = options.status ?? null;
     this.requestId = options.requestId ?? null;
+    this.upstreamRequestId = options.upstreamRequestId ?? null;
     this.clientRequestId = options.clientRequestId ?? null;
     this.retryable = Boolean(options.retryable);
     this.details = options.details || null;
@@ -21139,6 +21142,7 @@ function toPublicError(error2) {
     message: normalized.message,
     status: normalized.status,
     request_id: normalized.requestId,
+    upstream_request_id: normalized.upstreamRequestId,
     client_request_id: normalized.clientRequestId,
     retryable: normalized.retryable
   };
@@ -21180,9 +21184,10 @@ async function requestApiResponse({
     requestId: null,
     clientRequestId
   });
+  const responseIds = responseRequestIds(fetched.response.headers);
   return {
     response: fetched.response,
-    request_id: fetched.response.headers.get("x-request-id"),
+    ...responseIds,
     client_request_id: clientRequestId,
     lifecycle: fetched.lifecycle
   };
@@ -21192,6 +21197,7 @@ async function requestApiJson(options) {
   try {
     const json = await parseApiJsonResponse(result.response, {
       requestId: result.request_id,
+      upstreamRequestId: result.upstream_request_id,
       clientRequestId: result.client_request_id,
       secret: options.secret,
       lifecycle: result.lifecycle
@@ -21212,24 +21218,28 @@ async function parseApiJsonResponse(response, context = {}) {
       code: "NETWORK_ERROR",
       stage: "api_response",
       requestId: context.requestId,
+      upstreamRequestId: context.upstreamRequestId,
       clientRequestId: context.clientRequestId,
       retryable: false,
-      endpoint: response.url
+      endpoint: response.url,
+      details: responseDiagnostics(response, "")
     });
   }
+  const details = responseDiagnostics(response, text);
   let json;
   try {
     json = text ? JSON.parse(text) : {};
   } catch (cause) {
     if (!response.ok) {
-      throw new Image2Error(redactAndTruncate(text || `${response.status} ${response.statusText}`, context.secret, 500), {
+      throw new Image2Error(safeProviderMessage(text, context.secret) || `Image API request failed (HTTP ${response.status}).`, {
         code: "API_HTTP_ERROR",
         stage: "api_response",
         status: response.status,
         requestId: context.requestId,
+        upstreamRequestId: context.upstreamRequestId,
         clientRequestId: context.clientRequestId,
         retryable: isRetryableStatus(response.status),
-        details: { response: redactAndTruncate(text, context.secret) },
+        details,
         cause
       });
     }
@@ -21238,21 +21248,26 @@ async function parseApiJsonResponse(response, context = {}) {
       stage: "api_response",
       status: response.status,
       requestId: context.requestId,
+      upstreamRequestId: context.upstreamRequestId,
       clientRequestId: context.clientRequestId,
-      details: { response: redactAndTruncate(text, context.secret) },
+      details,
       cause
     });
   }
   if (!response.ok) {
     const rawMessage = json?.error?.message || json?.message || text || `${response.status} ${response.statusText}`;
-    throw new Image2Error(redactAndTruncate(rawMessage, context.secret, 500), {
+    throw new Image2Error(safeProviderMessage(rawMessage, context.secret) || `Image API request failed (HTTP ${response.status}).`, {
       code: "API_HTTP_ERROR",
       stage: "api_response",
       status: response.status,
       requestId: context.requestId,
+      upstreamRequestId: context.upstreamRequestId,
       clientRequestId: context.clientRequestId,
       retryable: isRetryableStatus(response.status),
-      details: { response: redactAndTruncate(text, context.secret) }
+      details: {
+        ...details,
+        payload_keys: objectKeys(json)
+      }
     });
   }
   return json;
@@ -21278,6 +21293,7 @@ async function persistImagesFromResponse(json, options) {
       code: "EMPTY_IMAGE_RESULT",
       stage: "image_decode",
       requestId: options.requestId,
+      upstreamRequestId: options.upstreamRequestId,
       clientRequestId: options.clientRequestId,
       retryable: false,
       details: { response_keys: objectKeys(json) }
@@ -21285,13 +21301,69 @@ async function persistImagesFromResponse(json, options) {
   }
   return saved;
 }
+async function consumeImageApiResponse(response, options) {
+  const responseContentType = response.headers.get("content-type") || "";
+  if (!response.ok) {
+    await parseApiJsonResponse(response, {
+      requestId: options.requestId,
+      upstreamRequestId: options.upstreamRequestId,
+      clientRequestId: options.clientRequestId,
+      secret: options.secret,
+      lifecycle: options.lifecycle
+    });
+  }
+  const responseMode = await detectImageResponseMode(response, options);
+  if (responseMode === "sse") {
+    const result = await consumeImageStream(response, {
+      ...options,
+      responseContentType,
+      responseStatus: response.status
+    });
+    return {
+      response_mode: "sse",
+      http_status: response.status,
+      response_content_type: responseContentType || null,
+      ...result
+    };
+  }
+  const json = await parseApiJsonResponse(response, {
+    requestId: options.requestId,
+    upstreamRequestId: options.upstreamRequestId,
+    clientRequestId: options.clientRequestId,
+    secret: options.secret,
+    lifecycle: options.lifecycle
+  });
+  const images = await persistImagesFromResponse(json, options);
+  return {
+    response_mode: "json",
+    http_status: response.status,
+    response_content_type: responseContentType || null,
+    partial_images: [],
+    images,
+    raw_usage: json?.usage || null,
+    request_id: options.requestId || null,
+    upstream_request_id: options.upstreamRequestId || null,
+    client_request_id: options.clientRequestId || null
+  };
+}
 async function consumeImageStream(response, options) {
   if (!response.body) {
     throw new Image2Error("Streaming response body is empty.", {
-      code: "INCOMPLETE_STREAM",
+      code: "UPSTREAM_PROTOCOL_ERROR",
       stage: "stream_parse",
+      status: options.responseStatus ?? response.status,
       requestId: options.requestId,
-      clientRequestId: options.clientRequestId
+      upstreamRequestId: options.upstreamRequestId,
+      clientRequestId: options.clientRequestId,
+      retryable: false,
+      details: {
+        response_content_type: options.responseContentType || response.headers.get("content-type") || null,
+        event_counts: {},
+        last_event_type: null,
+        done_seen: false,
+        payload_keys: [],
+        bytes_received: 0
+      }
     });
   }
   const reader = response.body.getReader();
@@ -21300,43 +21372,117 @@ async function consumeImageStream(response, options) {
   const partials = [];
   const finals = [];
   let rawUsage = null;
+  const expectedPrefix = options.operation === "edit" ? "image_edit" : "image_generation";
+  const allowedTypes = /* @__PURE__ */ new Set([
+    `${expectedPrefix}.partial_image`,
+    `${expectedPrefix}.completed`
+  ]);
+  const lifecycleTypes = /* @__PURE__ */ new Set([
+    `${expectedPrefix}.queued`,
+    `${expectedPrefix}.in_progress`
+  ]);
+  const diagnostics = {
+    operation: options.operation === "edit" ? "edit" : "generation",
+    response_content_type: options.responseContentType || response.headers.get("content-type") || null,
+    event_counts: {},
+    last_event_type: null,
+    done_seen: false,
+    partial_count: 0,
+    completed_count: 0,
+    payload_keys: [],
+    bytes_received: 0
+  };
+  let eventCount = 0;
+  let validImageEventCount = 0;
   const processFrames = async (frames) => {
     for (const frame of frames) {
       const event = parseSseEvent(frame);
-      if (!event || event.data === "[DONE]") continue;
+      if (!event) continue;
+      eventCount += 1;
+      if (eventCount > MAX_STREAM_EVENTS) {
+        throw protocolFailure("Image stream exceeded the event limit.", options, diagnostics, partials);
+      }
+      if (event.data.trim() === "[DONE]") {
+        diagnostics.done_seen = true;
+        countEvent(diagnostics, "[DONE]");
+        continue;
+      }
+      const headerType = normalizedEventType(event.event);
       let payload;
       try {
         payload = JSON.parse(event.data);
       } catch (cause) {
+        const invalidType = headerType || "<invalid-json>";
+        diagnostics.last_event_type = invalidType;
+        countEvent(diagnostics, invalidType);
         throw new Image2Error("Image stream contained invalid JSON.", {
           code: "INVALID_IMAGE_DATA",
           stage: "stream_parse",
+          status: options.responseStatus ?? response.status,
           requestId: options.requestId,
+          upstreamRequestId: options.upstreamRequestId,
           clientRequestId: options.clientRequestId,
-          details: { event: event.event, data: truncate(event.data, 500) },
+          details: streamDiagnostics(diagnostics),
           partialImages: partials,
           cause
         });
       }
-      if (event.event === "error" || payload?.error) {
-        const message = payload?.error?.message || payload?.message || "Image stream returned an error event.";
-        throw new Image2Error(truncate(String(message), 500), {
+      mergePayloadKeys(diagnostics, payload);
+      const directPayloadType = normalizedEventType(payload?.type);
+      const upstreamEventType = normalizedEventType(payload?.upstream_event_type);
+      if (directPayloadType && upstreamEventType && directPayloadType !== upstreamEventType) {
+        throw protocolFailure("Image stream wrapper event types do not match.", options, diagnostics, partials);
+      }
+      const payloadType = directPayloadType || upstreamEventType;
+      const eventType = headerType || payloadType;
+      diagnostics.last_event_type = eventType || null;
+      countEvent(diagnostics, eventType || "<missing>");
+      if (headerType && payloadType && headerType !== payloadType) {
+        throw protocolFailure("Image stream event name does not match payload type.", options, diagnostics, partials);
+      }
+      const eventPayload = normalizedImageEventPayload(payload, eventType);
+      if (!eventPayload) {
+        throw protocolFailure("Image stream nested event type does not match its wrapper.", options, diagnostics, partials);
+      }
+      if (eventType === "error" || eventPayload?.error) {
+        const message = eventPayload?.error?.message || eventPayload?.message || "Image stream returned an error event.";
+        throw new Image2Error(safeProviderMessage(message, options.secret) || "Image stream returned an error event.", {
           code: "API_HTTP_ERROR",
           stage: "stream_parse",
+          status: options.responseStatus ?? response.status,
           requestId: options.requestId,
+          upstreamRequestId: options.upstreamRequestId,
           clientRequestId: options.clientRequestId,
           retryable: false,
+          details: streamDiagnostics(diagnostics),
           partialImages: partials
         });
       }
-      if (payload?.usage) rawUsage = payload.usage;
-      const eventType = `${event.event || ""} ${payload?.type || ""}`.toLowerCase();
-      const imagePayload = imagePayloadFromItem(payload);
-      if (!imagePayload) continue;
-      if (eventType.includes("partial")) {
-        partials.push(await persistImagePayload(imagePayload, { ...options, kind: "partial" }));
-      } else if (eventType.includes("completed")) {
+      if (lifecycleTypes.has(eventType)) {
+        if (imagePayloadFromItem(eventPayload)) {
+          throw protocolFailure("Image stream lifecycle event unexpectedly contained an image payload.", options, diagnostics, partials);
+        }
+        validImageEventCount += 1;
+        if (eventPayload?.usage) rawUsage = eventPayload.usage;
+        continue;
+      }
+      if (!eventType || !allowedTypes.has(eventType)) {
+        throw protocolFailure("Image stream contained an unsupported event type.", options, diagnostics, partials);
+      }
+      validImageEventCount += 1;
+      if (eventPayload?.usage) rawUsage = eventPayload.usage;
+      const imagePayload = imagePayloadFromItem(eventPayload);
+      if (!imagePayload) {
+        throw protocolFailure("Image stream event did not contain an image payload.", options, diagnostics, partials);
+      }
+      if (eventType.endsWith(".partial_image")) {
+        const partial2 = await persistImagePayload(imagePayload, { ...options, kind: "partial" });
+        partials.push(partial2);
+        diagnostics.partial_count = partials.length;
+        await options.onPartial?.(partial2, [...partials]);
+      } else {
         finals.push(await persistImagePayload(imagePayload, { ...options, kind: "final" }));
+        diagnostics.completed_count = finals.length;
       }
     }
   };
@@ -21344,6 +21490,7 @@ async function consumeImageStream(response, options) {
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
+      diagnostics.bytes_received += value.byteLength;
       await processFrames(parser.push(decoder.decode(value, { stream: true })));
     }
     const trailingText = decoder.decode();
@@ -21356,20 +21503,28 @@ async function consumeImageStream(response, options) {
       code: "NETWORK_ERROR",
       stage: "stream_parse",
       requestId: options.requestId,
+      upstreamRequestId: options.upstreamRequestId,
       clientRequestId: options.clientRequestId,
       retryable: false,
-      endpoint: options.endpoint
+      endpoint: options.endpoint,
+      details: streamDiagnostics(diagnostics)
     });
     failure.partialImages = partials;
     throw failure;
+  }
+  if (!validImageEventCount) {
+    throw protocolFailure("Image stream ended without a valid Images API event.", options, diagnostics, partials);
   }
   if (!finals.length) {
     throw new Image2Error("Image stream ended without a completed image.", {
       code: "INCOMPLETE_STREAM",
       stage: "stream_parse",
+      status: options.responseStatus ?? response.status,
       requestId: options.requestId,
+      upstreamRequestId: options.upstreamRequestId,
       clientRequestId: options.clientRequestId,
       retryable: false,
+      details: streamDiagnostics(diagnostics),
       partialImages: partials
     });
   }
@@ -21378,7 +21533,9 @@ async function consumeImageStream(response, options) {
     images: finals,
     raw_usage: rawUsage,
     request_id: options.requestId || null,
-    client_request_id: options.clientRequestId || null
+    upstream_request_id: options.upstreamRequestId || null,
+    client_request_id: options.clientRequestId || null,
+    stream_diagnostics: streamDiagnostics(diagnostics)
   };
 }
 function parseSseEvent(frame) {
@@ -21395,6 +21552,109 @@ function parseSseEvent(frame) {
   }
   event.data = data.join("\n");
   return event.data ? event : null;
+}
+async function detectImageResponseMode(response, options) {
+  const contentType = response.headers.get("content-type") || "";
+  const mediaType = contentType.split(";", 1)[0].trim().toLowerCase();
+  if (mediaType === "text/event-stream") return "sse";
+  if (mediaType === "application/json" || mediaType.endsWith("+json")) return "json";
+  const sniffable = !mediaType || mediaType === "text/plain" || mediaType === "application/octet-stream";
+  if (sniffable) {
+    const prefix = await responsePrefix(response, RESPONSE_SNIFF_BYTES);
+    const trimmed = prefix.trimStart();
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) return "json";
+    if (trimmed.startsWith("data:") || trimmed.startsWith("event:") || trimmed.startsWith(":")) return "sse";
+  }
+  throw new Image2Error("Image API returned an unsupported response type.", {
+    code: "UPSTREAM_PROTOCOL_ERROR",
+    stage: "api_response",
+    status: response.status,
+    requestId: options.requestId,
+    upstreamRequestId: options.upstreamRequestId,
+    clientRequestId: options.clientRequestId,
+    retryable: false,
+    details: {
+      operation: options.operation === "edit" ? "edit" : "generation",
+      response_content_type: contentType || null
+    }
+  });
+}
+async function responsePrefix(response, limit) {
+  if (!response.body) return "";
+  const clone2 = response.clone();
+  const reader = clone2.body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  try {
+    while (text.length < limit) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      text += decoder.decode(value, { stream: true });
+      if (/^\s*(?:[\[{]|data:|event:|:)/.test(text)) break;
+    }
+    text += decoder.decode();
+    return text.slice(0, limit);
+  } finally {
+    void reader.cancel().catch(() => {
+    });
+  }
+}
+function normalizedEventType(value) {
+  return typeof value === "string" && value.trim() ? value.trim().toLowerCase() : null;
+}
+function normalizedImageEventPayload(payload, eventType) {
+  const nested = payload?.data;
+  if (!nested || typeof nested !== "object" || Array.isArray(nested)) return payload;
+  const nestedType = normalizedEventType(nested.type);
+  if (nestedType && nestedType !== eventType) return null;
+  return { ...nested, type: eventType };
+}
+function countEvent(diagnostics, eventType) {
+  diagnostics.event_counts[eventType] = (diagnostics.event_counts[eventType] || 0) + 1;
+}
+function mergePayloadKeys(diagnostics, payload) {
+  const keys = objectKeys(payload);
+  for (const key of keys) {
+    if (!diagnostics.payload_keys.includes(key) && diagnostics.payload_keys.length < 20) {
+      diagnostics.payload_keys.push(key);
+    }
+  }
+}
+function streamDiagnostics(diagnostics) {
+  return {
+    response_content_type: diagnostics.response_content_type,
+    event_counts: { ...diagnostics.event_counts },
+    last_event_type: diagnostics.last_event_type,
+    done_seen: diagnostics.done_seen,
+    payload_keys: [...diagnostics.payload_keys],
+    bytes_received: diagnostics.bytes_received
+  };
+}
+function protocolFailure(message, options, diagnostics, partialImages) {
+  return new Image2Error(message, {
+    code: "UPSTREAM_PROTOCOL_ERROR",
+    stage: "stream_parse",
+    status: options.responseStatus ?? null,
+    requestId: options.requestId,
+    upstreamRequestId: options.upstreamRequestId,
+    clientRequestId: options.clientRequestId,
+    retryable: false,
+    details: streamDiagnostics(diagnostics),
+    partialImages
+  });
+}
+function responseDiagnostics(response, text) {
+  return {
+    response_content_type: response.headers.get("content-type") || null,
+    payload_keys: [],
+    bytes_received: Buffer.byteLength(text || "", "utf8")
+  };
+}
+function safeProviderMessage(value, secret) {
+  let message = redactAndTruncate(value, secret, 500);
+  if (!message) return "";
+  message = message.replace(/\b(?:sk|sess|key|token)-[A-Za-z0-9_-]{16,}\b/gi, "<redacted>").replace(/\bBearer\s+[A-Za-z0-9._~+\/-]{12,}/gi, "Bearer <redacted>").replace(/\b[A-Za-z0-9+/]{80,}={0,2}\b/g, "<redacted-base64>");
+  return truncate(message, 500);
 }
 function detectImageFormat(bytes) {
   if (bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
@@ -21426,6 +21686,14 @@ function safeEndpoint(value) {
     return "<invalid-url>";
   }
 }
+function responseRequestIds(headers) {
+  const gatewayRequestId = headers.get("x-oneapi-request-id") || null;
+  const providerRequestId = headers.get("x-request-id") || null;
+  return {
+    request_id: gatewayRequestId || providerRequestId,
+    upstream_request_id: gatewayRequestId && providerRequestId && providerRequestId !== gatewayRequestId ? providerRequestId : null
+  };
+}
 async function persistImagePayload(payload, options) {
   const maxOutputBytes2 = positiveInteger(options.maxOutputBytes, DEFAULT_MAX_OUTPUT_BYTES);
   let bytes;
@@ -21443,6 +21711,7 @@ async function persistImagePayload(payload, options) {
       code: "INVALID_IMAGE_DATA",
       stage: "image_decode",
       requestId: options.requestId,
+      upstreamRequestId: options.upstreamRequestId,
       clientRequestId: options.clientRequestId,
       details: { bytes: bytes.length, source }
     });
@@ -21478,6 +21747,7 @@ function decodeBase64Image(value, maxOutputBytes2, context) {
         code: "INVALID_IMAGE_DATA",
         stage: "image_decode",
         requestId: context.requestId,
+        upstreamRequestId: context.upstreamRequestId,
         clientRequestId: context.clientRequestId
       });
     }
@@ -21489,6 +21759,7 @@ function decodeBase64Image(value, maxOutputBytes2, context) {
       code: "INVALID_IMAGE_DATA",
       stage: "image_decode",
       requestId: context.requestId,
+      upstreamRequestId: context.upstreamRequestId,
       clientRequestId: context.clientRequestId
     });
   }
@@ -21503,6 +21774,7 @@ function decodeBase64Image(value, maxOutputBytes2, context) {
       code: "INVALID_IMAGE_DATA",
       stage: "image_decode",
       requestId: context.requestId,
+      upstreamRequestId: context.upstreamRequestId,
       clientRequestId: context.clientRequestId
     });
   }
@@ -21518,6 +21790,7 @@ async function downloadImage(value, options) {
       code: "INVALID_IMAGE_DATA",
       stage: "image_download",
       requestId: options.requestId,
+      upstreamRequestId: options.upstreamRequestId,
       clientRequestId: options.clientRequestId,
       cause
     });
@@ -21527,6 +21800,7 @@ async function downloadImage(value, options) {
       code: "INVALID_IMAGE_DATA",
       stage: "image_download",
       requestId: options.requestId,
+      upstreamRequestId: options.upstreamRequestId,
       clientRequestId: options.clientRequestId,
       details: { url: safeEndpoint(target) }
     });
@@ -21546,6 +21820,7 @@ async function downloadImage(value, options) {
         stage: "image_download",
         networkErrorCode: "IMAGE_DOWNLOAD_ERROR",
         requestId: options.requestId,
+        upstreamRequestId: options.upstreamRequestId,
         clientRequestId: options.clientRequestId
       });
       const response = fetched.response;
@@ -21563,6 +21838,7 @@ async function downloadImage(value, options) {
           stage: "image_download",
           status: response.status,
           requestId: options.requestId,
+          upstreamRequestId: options.upstreamRequestId,
           clientRequestId: options.clientRequestId,
           retryable,
           details: { url: safeEndpoint(target) }
@@ -21575,6 +21851,7 @@ async function downloadImage(value, options) {
         code: "IMAGE_DOWNLOAD_ERROR",
         stage: "image_download",
         requestId: options.requestId,
+        upstreamRequestId: options.upstreamRequestId,
         clientRequestId: options.clientRequestId,
         retryable: true,
         endpoint: target
@@ -21593,6 +21870,7 @@ async function downloadImage(value, options) {
     code: "IMAGE_DOWNLOAD_ERROR",
     stage: "image_download",
     requestId: options.requestId,
+    upstreamRequestId: options.upstreamRequestId,
     clientRequestId: options.clientRequestId
   });
 }
@@ -21606,6 +21884,7 @@ async function readResponseBytes(response, maxOutputBytes2, context) {
       code: "IMAGE_DOWNLOAD_ERROR",
       stage: "image_download",
       requestId: context.requestId,
+      upstreamRequestId: context.upstreamRequestId,
       clientRequestId: context.clientRequestId
     });
   }
@@ -21627,6 +21906,7 @@ async function readResponseBytes(response, maxOutputBytes2, context) {
       code: "INVALID_IMAGE_DATA",
       stage: "image_decode",
       requestId: context.requestId,
+      upstreamRequestId: context.upstreamRequestId,
       clientRequestId: context.clientRequestId
     });
   }
@@ -21651,6 +21931,7 @@ function atomicWriteImage(bytes, extension, options) {
       code: "OUTPUT_WRITE_ERROR",
       stage: "image_persist",
       requestId: options.requestId,
+      upstreamRequestId: options.upstreamRequestId,
       clientRequestId: options.clientRequestId,
       details: { directory: options.outputDir, cause: causeDetails(cause) },
       cause
@@ -21669,6 +21950,7 @@ async function fetchWithTimeout(url, requestOptions, context) {
       code: context.networkErrorCode,
       stage: context.stage,
       requestId: context.requestId,
+      upstreamRequestId: context.upstreamRequestId,
       clientRequestId: context.clientRequestId,
       retryable: context.stage === "image_download",
       endpoint: url
@@ -21708,9 +21990,10 @@ function networkFailure(cause, context) {
       code: "REQUEST_TIMEOUT",
       stage: context.stage,
       requestId: context.requestId,
+      upstreamRequestId: context.upstreamRequestId,
       clientRequestId: context.clientRequestId,
       retryable: context.retryable,
-      details: { endpoint: safeEndpoint(context.endpoint), cause: causeDetails(cause) },
+      details: { ...context.details || {}, endpoint: safeEndpoint(context.endpoint), cause: causeDetails(cause) },
       cause
     });
   }
@@ -21719,6 +22002,7 @@ function networkFailure(cause, context) {
       code: "CANCELLED",
       stage: context.stage,
       requestId: context.requestId,
+      upstreamRequestId: context.upstreamRequestId,
       clientRequestId: context.clientRequestId,
       cause
     });
@@ -21728,9 +22012,10 @@ function networkFailure(cause, context) {
     code: context.code,
     stage: context.stage,
     requestId: context.requestId,
+    upstreamRequestId: context.upstreamRequestId,
     clientRequestId: context.clientRequestId,
     retryable: context.retryable,
-    details: { endpoint: safeEndpoint(context.endpoint), cause: causeDetails(cause) },
+    details: { ...context.details || {}, endpoint: safeEndpoint(context.endpoint), cause: causeDetails(cause) },
     cause
   });
 }
@@ -21782,6 +22067,7 @@ function outputTooLarge(maxOutputBytes2, context) {
     code: "INVALID_IMAGE_DATA",
     stage: "image_decode",
     requestId: context.requestId,
+    upstreamRequestId: context.upstreamRequestId,
     clientRequestId: context.clientRequestId,
     details: { max_output_bytes: maxOutputBytes2 }
   });
@@ -21854,9 +22140,8 @@ var JOBS_DIR = path2.join(SERVER_ROOT, "jobs");
 var INPUT_CACHE_DIR = path2.join(SERVER_ROOT, "input-cache");
 var ASSETS_FILE = path2.join(SERVER_ROOT, "assets.json");
 var DEFAULT_ENV_FILE = path2.join(os.homedir(), ".codex", "image2-mcp.env");
-var IMAGE2_SIZES = /* @__PURE__ */ new Set(["auto", "1024x1024", "1024x1536", "1536x1024"]);
 var IMAGE2_QUALITIES = /* @__PURE__ */ new Set(["auto", "high", "medium", "low"]);
-var BACKGROUNDS = /* @__PURE__ */ new Set(["auto", "opaque"]);
+var BACKGROUNDS = /* @__PURE__ */ new Set(["auto", "opaque", "transparent"]);
 var OUTPUT_FORMATS = /* @__PURE__ */ new Set(["png", "jpeg", "webp"]);
 var MODERATIONS = /* @__PURE__ */ new Set(["auto", "low"]);
 var MAX_PARTIAL_IMAGES = 3;
@@ -21878,19 +22163,19 @@ fs2.mkdirSync(JOBS_DIR, { recursive: true });
 fs2.mkdirSync(INPUT_CACHE_DIR, { recursive: true });
 var inputBudgetFields = {
   image_asset_ids: external_exports.array(external_exports.string()).max(8).optional().describe("Previously registered Image2 asset ids to use as input references. Prefer this over re-sending old image context."),
-  input_preprocessing: external_exports.boolean().default(true).describe("Downsample and compress local input images before upload to keep request bodies within budget."),
+  input_preprocessing: external_exports.boolean().default(true).describe("Downsample or compress local input images only when they exceed the configured dimensions or byte budget."),
   max_input_bytes: external_exports.number().int().min(256 * 1024).max(100 * 1024 * 1024).default(DEFAULT_MAX_INPUT_BYTES).describe("Maximum total prepared image bytes allowed for one edit request."),
   max_single_input_bytes: external_exports.number().int().min(128 * 1024).max(50 * 1024 * 1024).default(DEFAULT_MAX_SINGLE_INPUT_BYTES).describe("Target maximum bytes for each prepared input image."),
   max_input_long_edge: external_exports.number().int().min(256).max(4096).default(DEFAULT_MAX_INPUT_LONG_EDGE).describe("Maximum long edge for prepared input images."),
   input_compression_quality: external_exports.number().int().min(40).max(100).default(DEFAULT_INPUT_COMPRESSION_QUALITY).describe("JPEG compression quality for prepared opaque input images."),
-  preserve_alpha: external_exports.boolean().default(true).describe("Preserve alpha channels in input reference images during preprocessing only. GPT Image2 output transparency is not supported.")
+  preserve_alpha: external_exports.boolean().default(true).describe("Preserve alpha channels when an input image must be resized or converted.")
 };
 var commonFields = {
   prompt: external_exports.string().min(1).describe("Image prompt. Keep text-heavy content out of images when the asset will be placed into editable PPTX."),
   model: external_exports.string().default(defaultModel).describe("Image model name. Default comes from IMAGE2_MODEL, normally gpt-image-2. Do not override it unless the user explicitly asks for another model."),
-  size: external_exports.string().default("auto").describe("Output size. Official presets are auto, 1024x1024, 1024x1536, 1536x1024. Custom sizes may be accepted by compatible providers if they meet provider constraints."),
+  size: external_exports.string().default("auto").describe("Output size: auto or WIDTHxHEIGHT within GPT Image2 edge, ratio, divisibility, and pixel-count limits."),
   quality: external_exports.enum(["auto", "high", "medium", "low"]).default("auto").describe("Rendering quality. Higher quality can cost more and take longer."),
-  background: external_exports.enum(["auto", "opaque"]).default("auto").describe("Background mode for generation/editing. GPT Image2 does not support transparent backgrounds, alpha output, or transparent PNG generation."),
+  background: external_exports.enum(["auto", "opaque", "transparent"]).default("auto").describe("Background mode. GPT Image2 transparent output is a preview feature and requires png or webp."),
   output_format: external_exports.enum(["png", "jpeg", "webp"]).default("png").describe("Output image format. Use png for PPT assets unless file size matters."),
   moderation: external_exports.enum(["auto", "low"]).default("auto").describe("Moderation strictness where supported by the provider."),
   output_compression: external_exports.number().int().min(0).max(100).optional().describe("Compression level for jpeg/webp where supported; ignored for png by many providers."),
@@ -21899,14 +22184,14 @@ var commonFields = {
   filename_prefix: external_exports.string().regex(/^[a-zA-Z0-9._-]+$/).default("image2").describe("Safe prefix for saved image filenames."),
   stream: external_exports.boolean().default(false).describe("Use streaming image generation when supported. Saves partial images and final images."),
   partial_images: external_exports.number().int().min(0).max(MAX_PARTIAL_IMAGES).default(0).describe("Number of partial images to request with stream=true. Official range is 0-3."),
-  extra: external_exports.record(external_exports.unknown()).optional().describe("Provider-specific passthrough parameters. Values here override matching top-level request fields.")
+  extra: external_exports.record(external_exports.unknown()).optional().describe("Provider-specific passthrough parameters. stream and partial_images are reserved; other matching fields are revalidated after override.")
 };
 var generateSchema = external_exports.object(commonFields);
 var editSchema = external_exports.object({
   ...commonFields,
   ...inputBudgetFields,
   image_paths: external_exports.array(external_exports.string()).max(8).optional().describe("Input image file paths to edit. Prefer image_asset_ids for images already used in this thread."),
-  mask_path: external_exports.string().optional().describe("Optional mask image path for compatible OpenAI-style APIs. GPT Image2 output transparency is not supported.")
+  mask_path: external_exports.string().optional().describe("Optional mask image path for compatible OpenAI-style APIs.")
 });
 var registerAssetSchema = external_exports.object({
   image_path: external_exports.string().min(1).describe("Local image path to register as a reusable Image2 asset."),
@@ -21967,7 +22252,7 @@ server.tool(
 );
 server.tool(
   "image2_edit",
-  "Edit one or more images with a GPT Image compatible API and save the outputs to disk. GPT Image2 does not support transparent backgrounds, alpha output, or transparent PNG generation.",
+  "Edit one or more images with a GPT Image compatible API and save the outputs to disk. Supports Images API JSON or SSE responses.",
   editSchema.shape,
   withToolErrors(async (args) => {
     const result = await editImages(args);
@@ -21991,7 +22276,7 @@ server.tool(
 );
 server.tool(
   "image2_extract_elements",
-  "Use Image2 image editing to isolate or recreate described subjects/elements from a source image as opaque PNG/WebP assets. GPT Image2 does not support transparent backgrounds, alpha output, or transparent PNG generation.",
+  "Use Image2 image editing to isolate or recreate described subjects/elements from a source image as intentionally opaque PNG/WebP assets.",
   extractElementsSchema.shape,
   withToolErrors(async (args) => {
     const result = await extractDesignElements(args);
@@ -22000,7 +22285,7 @@ server.tool(
 );
 server.tool(
   "image2_start_generation",
-  "Start a background image generation job. Use image2_get_job to poll status later.",
+  "Start a background image generation job. Streaming jobs expose saved partial images through image2_get_job while still running.",
   startSchema.shape,
   withToolErrors(async (args) => {
     const jobId = randomUUID2();
@@ -22013,13 +22298,16 @@ server.tool(
       created_at: now,
       updated_at: now,
       request: sanitizeForRecord(args),
+      partial_images: [],
       result: null,
       error: null,
       controller
     };
     jobs.set(jobId, record2);
     writeJob(record2);
-    generateImages(args, controller.signal).then((result) => {
+    generateImages(args, controller.signal, async (_partial, partialImages) => {
+      updateJob(jobId, { partial_images: partialImages });
+    }).then((result) => {
       updateJob(jobId, { status: "completed", result });
     }).catch((error2) => {
       const publicError = toPublicError(error2);
@@ -22070,53 +22358,15 @@ if (!apiKey) {
   console.error("IMAGE2_API_KEY is not configured. Set it in ~/.codex/image2-mcp.env.");
 }
 await server.connect(new StdioServerTransport());
-async function generateImages(args, signal) {
+async function generateImages(args, signal, onPartial) {
   assertConfigured();
   const outputDir = ensureOutputDir(args.output_dir);
   const request = buildJsonRequest(args);
   const endpoint = `${baseUrl}/images/generations`;
-  if (args.stream) {
-    const apiResult2 = await requestApiResponse({
-      endpoint,
-      headers: {
-        ...authHeaders(),
-        "content-type": "application/json"
-      },
-      body: JSON.stringify(request),
-      signal,
-      timeoutMs: requestTimeoutMs
-    });
-    try {
-      if (!apiResult2.response.ok) {
-        await parseApiJsonResponse(apiResult2.response, {
-          requestId: apiResult2.request_id,
-          clientRequestId: apiResult2.client_request_id,
-          secret: apiKey,
-          lifecycle: apiResult2.lifecycle
-        });
-      }
-      const streamResult = await consumeImageStream(apiResult2.response, transportOptions({
-        outputDir,
-        prefix: args.filename_prefix,
-        outputFormat: args.output_format,
-        signal,
-        requestId: apiResult2.request_id,
-        clientRequestId: apiResult2.client_request_id,
-        lifecycle: apiResult2.lifecycle,
-        endpoint
-      }));
-      return {
-        mode: "generation",
-        endpoint,
-        model: request.model,
-        stream: true,
-        ...streamResult
-      };
-    } finally {
-      apiResult2.lifecycle.cleanup();
-    }
-  }
-  const apiResult = await requestApiJson({
+  return requestImages({
+    operation: "generation",
+    args,
+    request,
     endpoint,
     headers: {
       ...authHeaders(),
@@ -22124,27 +22374,9 @@ async function generateImages(args, signal) {
     },
     body: JSON.stringify(request),
     signal,
-    timeoutMs: requestTimeoutMs,
-    secret: apiKey
-  });
-  const saved = await persistImagesFromResponse(apiResult.json, transportOptions({
     outputDir,
-    prefix: args.filename_prefix,
-    outputFormat: args.output_format,
-    signal,
-    requestId: apiResult.request_id,
-    clientRequestId: apiResult.client_request_id
-  }));
-  return {
-    mode: "generation",
-    endpoint,
-    model: request.model,
-    stream: false,
-    images: saved,
-    raw_usage: apiResult.json.usage || null,
-    request_id: apiResult.request_id,
-    client_request_id: apiResult.client_request_id
-  };
+    onPartial
+  });
 }
 async function runDoctor(args) {
   const checks = [];
@@ -22170,6 +22402,7 @@ async function runDoctor(args) {
     addCheck("output_directory", "fail", `Output directory is not writable: ${error2.message}`);
   }
   let requestId = null;
+  let upstreamRequestId = null;
   let clientRequestId = null;
   if (!args.network) {
     addCheck("api", "warn", "Network checks were skipped by request.");
@@ -22185,6 +22418,7 @@ async function runDoctor(args) {
         secret: apiKey
       });
       requestId = result.request_id;
+      upstreamRequestId = result.upstream_request_id;
       clientRequestId = result.client_request_id;
       const models = Array.isArray(result.json?.data) ? result.json.data.map((item) => item?.id).filter(Boolean) : null;
       if (!models) {
@@ -22197,6 +22431,7 @@ async function runDoctor(args) {
     } catch (error2) {
       const publicError = toPublicError(error2);
       requestId = publicError.request_id;
+      upstreamRequestId = publicError.upstream_request_id;
       clientRequestId = publicError.client_request_id;
       if ([404, 405, 501].includes(publicError.status)) {
         addCheck("api", "warn", "The provider does not support the models endpoint; generation was not attempted.");
@@ -22212,6 +22447,7 @@ async function runDoctor(args) {
     base_url: safeEndpoint(baseUrl),
     model: defaultModel,
     request_id: requestId,
+    upstream_request_id: upstreamRequestId,
     client_request_id: clientRequestId
   };
 }
@@ -22287,7 +22523,7 @@ async function extractDesignElements(args, signal) {
     source_image: expandHome(args.image_path),
     source_proxy: inputReportForResult([sourceProxy]),
     output_dir: outputDir,
-    extraction_note: "This uses Image2 image editing to isolate or reconstruct named elements from a flattened source image as opaque images. GPT Image2 does not support transparent backgrounds, alpha output, or transparent PNG generation. It does not recover original PSD/Figma layers or use external background-removal helpers.",
+    extraction_note: "This tool intentionally isolates or reconstructs named elements from a flattened source image as opaque images. It does not recover original PSD/Figma layers or use external background-removal helpers.",
     elements: extracted,
     background
   };
@@ -22308,41 +22544,71 @@ async function editImages(args, signal) {
     }
   }
   for (const input of preparedInputs) {
-    form.append("image", await fileBlob(input.path), path2.basename(input.path));
+    form.append("image[]", await fileBlob(input.path), path2.basename(input.path));
   }
   if (args.mask_path) {
     const mask = await prepareInputImage(args.mask_path, { ...args, preserve_alpha: true });
     form.append("mask", await fileBlob(mask.path), path2.basename(mask.path));
   }
-  const apiResult = await requestApiJson({
+  return requestImages({
+    operation: "edit",
+    args,
+    request,
     endpoint,
     headers: authHeaders(),
     body: form,
     signal,
-    timeoutMs: requestTimeoutMs,
-    secret: apiKey
-  });
-  const saved = await persistImagesFromResponse(apiResult.json, transportOptions({
     outputDir,
-    prefix: args.filename_prefix,
-    outputFormat: args.output_format,
-    signal,
-    requestId: apiResult.request_id,
-    clientRequestId: apiResult.client_request_id
-  }));
-  return {
-    mode: "edit",
+    inputContext: inputReportForResult(preparedInputs)
+  });
+}
+async function requestImages({ operation, args, request, endpoint, headers, body, signal, outputDir, inputContext, onPartial }) {
+  const streamRequested = Boolean(request.stream);
+  const partialImagesRequested = streamRequested ? request.partial_images || 0 : 0;
+  const apiResult = await requestApiResponse({
     endpoint,
-    model: request.model,
-    input_context: inputReportForResult(preparedInputs),
-    images: saved,
-    raw_usage: apiResult.json.usage || null,
-    request_id: apiResult.request_id,
-    client_request_id: apiResult.client_request_id
-  };
+    headers: {
+      ...headers,
+      accept: streamRequested ? "text/event-stream" : "application/json"
+    },
+    body,
+    signal,
+    timeoutMs: requestTimeoutMs
+  });
+  try {
+    const consumed = await consumeImageApiResponse(apiResult.response, transportOptions({
+      outputDir,
+      prefix: args.filename_prefix,
+      outputFormat: args.output_format,
+      signal,
+      requestId: apiResult.request_id,
+      upstreamRequestId: apiResult.upstream_request_id,
+      clientRequestId: apiResult.client_request_id,
+      lifecycle: apiResult.lifecycle,
+      endpoint,
+      operation,
+      secret: apiKey,
+      onPartial
+    }));
+    return {
+      mode: operation,
+      endpoint,
+      model: request.model,
+      stream: streamRequested,
+      stream_requested: streamRequested,
+      response_mode: consumed.response_mode,
+      partial_images_requested: partialImagesRequested,
+      ...inputContext ? { input_context: inputContext } : {},
+      ...consumed
+    };
+  } finally {
+    apiResult.lifecycle.cleanup();
+  }
 }
 function buildJsonRequest(args) {
-  validateImageArgs(args);
+  if (Object.hasOwn(args.extra || {}, "stream") || Object.hasOwn(args.extra || {}, "partial_images")) {
+    throw invalidArgument("extra.stream and extra.partial_images are reserved. Use the top-level fields instead.");
+  }
   const request = {
     model: args.model || defaultModel,
     prompt: args.prompt,
@@ -22364,9 +22630,11 @@ function buildJsonRequest(args) {
     ...request,
     ...args.extra || {}
   };
-  if (merged.background === "transparent") {
-    throw new Error("GPT Image2 does not support transparent backgrounds, alpha output, or transparent PNG generation.");
-  }
+  validateImageArgs({
+    ...merged,
+    stream: Boolean(args.stream),
+    partial_images: args.partial_images ?? 0
+  });
   return merged;
 }
 function normalizeElementSpec(element) {
@@ -22390,7 +22658,7 @@ function buildElementExtractionPrompt(element, promptPrefix) {
     element.description ? `Element identification: ${element.description}.` : "",
     element.prompt ? `Element-specific instruction: ${element.prompt}.` : "",
     promptPrefix ? `Shared instruction: ${promptPrefix}.` : "",
-    "Output an opaque PNG/WebP image. GPT Image2 does not support transparent backgrounds, alpha output, or transparent PNG generation.",
+    "Output an opaque PNG/WebP image for this extraction workflow.",
     "Focus on the requested subject. Reduce surrounding scene, UI, background, unrelated objects, labels, captions, shadows that belong to the background, and cropped neighboring elements where possible, but do not claim to create a true transparent cutout.",
     "Preserve the subject's visible style, colors, lighting, texture, proportions, silhouette, soft edges, glow, and fine details from the source image.",
     "Center the subject with a small safe margin. Do not crop the subject. Do not add a frame, canvas, sticker border, drop shadow, or new decorative elements.",
@@ -22413,24 +22681,49 @@ function slugifyFilename(value) {
   return slug || "element";
 }
 function validateImageArgs(args) {
-  if (!IMAGE2_SIZES.has(args.size) && !/^\d+x\d+$/.test(args.size)) {
-    throw new Error(`Invalid size '${args.size}'. Use auto, 1024x1024, 1024x1536, 1536x1024, or a provider-supported WIDTHxHEIGHT.`);
+  if (args.size !== "auto") {
+    const match = /^(\d+)x(\d+)$/.exec(args.size || "");
+    if (!match) throw invalidArgument(`Invalid size '${args.size}'. Use auto or WIDTHxHEIGHT.`);
+    const width = Number(match[1]);
+    const height = Number(match[2]);
+    const longEdge = Math.max(width, height);
+    const shortEdge = Math.min(width, height);
+    const pixels = width * height;
+    if (longEdge > 3840 || width % 16 !== 0 || height % 16 !== 0 || longEdge / shortEdge > 3 || pixels < 655360 || pixels > 8294400) {
+      throw invalidArgument(`Invalid size '${args.size}'. Edges must be multiples of 16, max 3840px, ratio at most 3:1, and total pixels 655360-8294400.`);
+    }
   }
   if (!IMAGE2_QUALITIES.has(args.quality)) {
-    throw new Error(`Invalid quality '${args.quality}'.`);
+    throw invalidArgument(`Invalid quality '${args.quality}'.`);
   }
   if (!BACKGROUNDS.has(args.background)) {
-    throw new Error(`Invalid background '${args.background}'. GPT Image2 supports auto or opaque only; transparent output is not supported.`);
+    throw invalidArgument(`Invalid background '${args.background}'.`);
   }
   if (!OUTPUT_FORMATS.has(args.output_format)) {
-    throw new Error(`Invalid output_format '${args.output_format}'.`);
+    throw invalidArgument(`Invalid output_format '${args.output_format}'.`);
   }
   if (!MODERATIONS.has(args.moderation)) {
-    throw new Error(`Invalid moderation '${args.moderation}'.`);
+    throw invalidArgument(`Invalid moderation '${args.moderation}'.`);
   }
-  if (args.partial_images > MAX_PARTIAL_IMAGES) {
-    throw new Error("partial_images must be between 0 and 3.");
+  if (!Number.isInteger(args.n) || args.n < 1 || args.n > 10) {
+    throw invalidArgument("n must be an integer between 1 and 10.");
   }
+  if (typeof args.stream !== "undefined" && typeof args.stream !== "boolean") {
+    throw invalidArgument("stream must be a boolean.");
+  }
+  const partialImages = args.partial_images ?? 0;
+  if (!Number.isInteger(partialImages) || partialImages < 0 || partialImages > MAX_PARTIAL_IMAGES) {
+    throw invalidArgument("partial_images must be an integer between 0 and 3.");
+  }
+  if (partialImages > 0 && !args.stream) {
+    throw invalidArgument("partial_images greater than 0 requires stream=true.");
+  }
+  if (args.background === "transparent" && !(/* @__PURE__ */ new Set(["png", "webp"])).has(args.output_format)) {
+    throw invalidArgument("background=transparent requires output_format png or webp.");
+  }
+}
+function invalidArgument(message) {
+  return new Image2Error(message, { code: "INVALID_ARGUMENT", stage: "validation" });
 }
 async function prepareInputImages(args) {
   const paths = resolveInputImagePaths(args);
@@ -22477,7 +22770,8 @@ async function prepareInputImage(imagePath, args = {}) {
   const maxSingleBytes = args.max_single_input_bytes || DEFAULT_MAX_SINGLE_INPUT_BYTES;
   const hasAlpha = Boolean(original.hasAlpha);
   const shouldResize = original.longEdge > maxLongEdge;
-  const shouldCompress = original.bytes > maxSingleBytes || original.ext === ".png" || original.ext === ".tiff" || original.ext === ".tif";
+  const needsFormatConversion = original.ext === ".tiff" || original.ext === ".tif";
+  const shouldCompress = original.bytes > maxSingleBytes || needsFormatConversion;
   if (!inputPreprocessing || process.platform !== "darwin" || !shouldResize && !shouldCompress) {
     return {
       path: resolved,
@@ -22688,16 +22982,20 @@ function positiveIntegerEnv(name, fallback) {
   const value = Number(process.env[name]);
   return Number.isInteger(value) && value > 0 ? value : fallback;
 }
-function transportOptions({ outputDir, prefix, outputFormat, signal, requestId, clientRequestId, lifecycle, endpoint }) {
+function transportOptions({ outputDir, prefix, outputFormat, signal, requestId, upstreamRequestId, clientRequestId, lifecycle, endpoint, operation, secret, onPartial }) {
   return {
     outputDir,
     prefix,
     outputFormat,
     signal,
     requestId,
+    upstreamRequestId,
     clientRequestId,
     lifecycle,
     endpoint,
+    operation,
+    secret,
+    onPartial,
     baseUrl,
     downloadTimeoutMs,
     maxOutputBytes

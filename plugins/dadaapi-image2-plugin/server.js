@@ -10,10 +10,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import {
   Image2Error,
-  consumeImageStream,
+  consumeImageApiResponse,
   mimeTypeForPath,
-  parseApiJsonResponse,
-  persistImagesFromResponse,
   requestApiJson,
   requestApiResponse,
   safeEndpoint,
@@ -27,9 +25,8 @@ const JOBS_DIR = path.join(SERVER_ROOT, "jobs");
 const INPUT_CACHE_DIR = path.join(SERVER_ROOT, "input-cache");
 const ASSETS_FILE = path.join(SERVER_ROOT, "assets.json");
 const DEFAULT_ENV_FILE = path.join(os.homedir(), ".codex", "image2-mcp.env");
-const IMAGE2_SIZES = new Set(["auto", "1024x1024", "1024x1536", "1536x1024"]);
 const IMAGE2_QUALITIES = new Set(["auto", "high", "medium", "low"]);
-const BACKGROUNDS = new Set(["auto", "opaque"]);
+const BACKGROUNDS = new Set(["auto", "opaque", "transparent"]);
 const OUTPUT_FORMATS = new Set(["png", "jpeg", "webp"]);
 const MODERATIONS = new Set(["auto", "low"]);
 const MAX_PARTIAL_IMAGES = 3;
@@ -55,20 +52,20 @@ fs.mkdirSync(INPUT_CACHE_DIR, { recursive: true });
 
 const inputBudgetFields = {
   image_asset_ids: z.array(z.string()).max(8).optional().describe("Previously registered Image2 asset ids to use as input references. Prefer this over re-sending old image context."),
-  input_preprocessing: z.boolean().default(true).describe("Downsample and compress local input images before upload to keep request bodies within budget."),
+  input_preprocessing: z.boolean().default(true).describe("Downsample or compress local input images only when they exceed the configured dimensions or byte budget."),
   max_input_bytes: z.number().int().min(256 * 1024).max(100 * 1024 * 1024).default(DEFAULT_MAX_INPUT_BYTES).describe("Maximum total prepared image bytes allowed for one edit request."),
   max_single_input_bytes: z.number().int().min(128 * 1024).max(50 * 1024 * 1024).default(DEFAULT_MAX_SINGLE_INPUT_BYTES).describe("Target maximum bytes for each prepared input image."),
   max_input_long_edge: z.number().int().min(256).max(4096).default(DEFAULT_MAX_INPUT_LONG_EDGE).describe("Maximum long edge for prepared input images."),
   input_compression_quality: z.number().int().min(40).max(100).default(DEFAULT_INPUT_COMPRESSION_QUALITY).describe("JPEG compression quality for prepared opaque input images."),
-  preserve_alpha: z.boolean().default(true).describe("Preserve alpha channels in input reference images during preprocessing only. GPT Image2 output transparency is not supported.")
+  preserve_alpha: z.boolean().default(true).describe("Preserve alpha channels when an input image must be resized or converted.")
 };
 
 const commonFields = {
   prompt: z.string().min(1).describe("Image prompt. Keep text-heavy content out of images when the asset will be placed into editable PPTX."),
   model: z.string().default(defaultModel).describe("Image model name. Default comes from IMAGE2_MODEL, normally gpt-image-2. Do not override it unless the user explicitly asks for another model."),
-  size: z.string().default("auto").describe("Output size. Official presets are auto, 1024x1024, 1024x1536, 1536x1024. Custom sizes may be accepted by compatible providers if they meet provider constraints."),
+  size: z.string().default("auto").describe("Output size: auto or WIDTHxHEIGHT within GPT Image2 edge, ratio, divisibility, and pixel-count limits."),
   quality: z.enum(["auto", "high", "medium", "low"]).default("auto").describe("Rendering quality. Higher quality can cost more and take longer."),
-  background: z.enum(["auto", "opaque"]).default("auto").describe("Background mode for generation/editing. GPT Image2 does not support transparent backgrounds, alpha output, or transparent PNG generation."),
+  background: z.enum(["auto", "opaque", "transparent"]).default("auto").describe("Background mode. GPT Image2 transparent output is a preview feature and requires png or webp."),
   output_format: z.enum(["png", "jpeg", "webp"]).default("png").describe("Output image format. Use png for PPT assets unless file size matters."),
   moderation: z.enum(["auto", "low"]).default("auto").describe("Moderation strictness where supported by the provider."),
   output_compression: z.number().int().min(0).max(100).optional().describe("Compression level for jpeg/webp where supported; ignored for png by many providers."),
@@ -77,7 +74,7 @@ const commonFields = {
   filename_prefix: z.string().regex(/^[a-zA-Z0-9._-]+$/).default("image2").describe("Safe prefix for saved image filenames."),
   stream: z.boolean().default(false).describe("Use streaming image generation when supported. Saves partial images and final images."),
   partial_images: z.number().int().min(0).max(MAX_PARTIAL_IMAGES).default(0).describe("Number of partial images to request with stream=true. Official range is 0-3."),
-  extra: z.record(z.unknown()).optional().describe("Provider-specific passthrough parameters. Values here override matching top-level request fields.")
+  extra: z.record(z.unknown()).optional().describe("Provider-specific passthrough parameters. stream and partial_images are reserved; other matching fields are revalidated after override.")
 };
 
 const generateSchema = z.object(commonFields);
@@ -86,7 +83,7 @@ const editSchema = z.object({
   ...commonFields,
   ...inputBudgetFields,
   image_paths: z.array(z.string()).max(8).optional().describe("Input image file paths to edit. Prefer image_asset_ids for images already used in this thread."),
-  mask_path: z.string().optional().describe("Optional mask image path for compatible OpenAI-style APIs. GPT Image2 output transparency is not supported.")
+  mask_path: z.string().optional().describe("Optional mask image path for compatible OpenAI-style APIs.")
 });
 
 const registerAssetSchema = z.object({
@@ -157,7 +154,7 @@ server.tool(
 
 server.tool(
   "image2_edit",
-  "Edit one or more images with a GPT Image compatible API and save the outputs to disk. GPT Image2 does not support transparent backgrounds, alpha output, or transparent PNG generation.",
+  "Edit one or more images with a GPT Image compatible API and save the outputs to disk. Supports Images API JSON or SSE responses.",
   editSchema.shape,
   withToolErrors(async (args) => {
     const result = await editImages(args);
@@ -184,7 +181,7 @@ server.tool(
 
 server.tool(
   "image2_extract_elements",
-  "Use Image2 image editing to isolate or recreate described subjects/elements from a source image as opaque PNG/WebP assets. GPT Image2 does not support transparent backgrounds, alpha output, or transparent PNG generation.",
+  "Use Image2 image editing to isolate or recreate described subjects/elements from a source image as intentionally opaque PNG/WebP assets.",
   extractElementsSchema.shape,
   withToolErrors(async (args) => {
     const result = await extractDesignElements(args);
@@ -194,7 +191,7 @@ server.tool(
 
 server.tool(
   "image2_start_generation",
-  "Start a background image generation job. Use image2_get_job to poll status later.",
+  "Start a background image generation job. Streaming jobs expose saved partial images through image2_get_job while still running.",
   startSchema.shape,
   withToolErrors(async (args) => {
     const jobId = randomUUID();
@@ -207,6 +204,7 @@ server.tool(
       created_at: now,
       updated_at: now,
       request: sanitizeForRecord(args),
+      partial_images: [],
       result: null,
       error: null,
       controller
@@ -215,7 +213,9 @@ server.tool(
     jobs.set(jobId, record);
     writeJob(record);
 
-    generateImages(args, controller.signal)
+    generateImages(args, controller.signal, async (_partial, partialImages) => {
+      updateJob(jobId, { partial_images: partialImages });
+    })
       .then((result) => {
         updateJob(jobId, { status: "completed", result });
       })
@@ -276,55 +276,15 @@ if (!apiKey) {
 
 await server.connect(new StdioServerTransport());
 
-async function generateImages(args, signal) {
+async function generateImages(args, signal, onPartial) {
   assertConfigured();
   const outputDir = ensureOutputDir(args.output_dir);
   const request = buildJsonRequest(args);
   const endpoint = `${baseUrl}/images/generations`;
-
-  if (args.stream) {
-    const apiResult = await requestApiResponse({
-      endpoint,
-      headers: {
-        ...authHeaders(),
-        "content-type": "application/json"
-      },
-      body: JSON.stringify(request),
-      signal,
-      timeoutMs: requestTimeoutMs
-    });
-    try {
-      if (!apiResult.response.ok) {
-        await parseApiJsonResponse(apiResult.response, {
-          requestId: apiResult.request_id,
-          clientRequestId: apiResult.client_request_id,
-          secret: apiKey,
-          lifecycle: apiResult.lifecycle
-        });
-      }
-      const streamResult = await consumeImageStream(apiResult.response, transportOptions({
-        outputDir,
-        prefix: args.filename_prefix,
-        outputFormat: args.output_format,
-        signal,
-        requestId: apiResult.request_id,
-        clientRequestId: apiResult.client_request_id,
-        lifecycle: apiResult.lifecycle,
-        endpoint
-      }));
-      return {
-        mode: "generation",
-        endpoint,
-        model: request.model,
-        stream: true,
-        ...streamResult
-      };
-    } finally {
-      apiResult.lifecycle.cleanup();
-    }
-  }
-
-  const apiResult = await requestApiJson({
+  return requestImages({
+    operation: "generation",
+    args,
+    request,
     endpoint,
     headers: {
       ...authHeaders(),
@@ -332,27 +292,9 @@ async function generateImages(args, signal) {
     },
     body: JSON.stringify(request),
     signal,
-    timeoutMs: requestTimeoutMs,
-    secret: apiKey
-  });
-  const saved = await persistImagesFromResponse(apiResult.json, transportOptions({
     outputDir,
-    prefix: args.filename_prefix,
-    outputFormat: args.output_format,
-    signal,
-    requestId: apiResult.request_id,
-    clientRequestId: apiResult.client_request_id
-  }));
-  return {
-    mode: "generation",
-    endpoint,
-    model: request.model,
-    stream: false,
-    images: saved,
-    raw_usage: apiResult.json.usage || null,
-    request_id: apiResult.request_id,
-    client_request_id: apiResult.client_request_id
-  };
+    onPartial
+  });
 }
 
 async function runDoctor(args) {
@@ -381,6 +323,7 @@ async function runDoctor(args) {
   }
 
   let requestId = null;
+  let upstreamRequestId = null;
   let clientRequestId = null;
   if (!args.network) {
     addCheck("api", "warn", "Network checks were skipped by request.");
@@ -396,6 +339,7 @@ async function runDoctor(args) {
         secret: apiKey
       });
       requestId = result.request_id;
+      upstreamRequestId = result.upstream_request_id;
       clientRequestId = result.client_request_id;
       const models = Array.isArray(result.json?.data)
         ? result.json.data.map((item) => item?.id).filter(Boolean)
@@ -410,6 +354,7 @@ async function runDoctor(args) {
     } catch (error) {
       const publicError = toPublicError(error);
       requestId = publicError.request_id;
+      upstreamRequestId = publicError.upstream_request_id;
       clientRequestId = publicError.client_request_id;
       if ([404, 405, 501].includes(publicError.status)) {
         addCheck("api", "warn", "The provider does not support the models endpoint; generation was not attempted.");
@@ -430,6 +375,7 @@ async function runDoctor(args) {
     base_url: safeEndpoint(baseUrl),
     model: defaultModel,
     request_id: requestId,
+    upstream_request_id: upstreamRequestId,
     client_request_id: clientRequestId
   };
 }
@@ -511,7 +457,7 @@ async function extractDesignElements(args, signal) {
     source_image: expandHome(args.image_path),
     source_proxy: inputReportForResult([sourceProxy]),
     output_dir: outputDir,
-    extraction_note: "This uses Image2 image editing to isolate or reconstruct named elements from a flattened source image as opaque images. GPT Image2 does not support transparent backgrounds, alpha output, or transparent PNG generation. It does not recover original PSD/Figma layers or use external background-removal helpers.",
+    extraction_note: "This tool intentionally isolates or reconstructs named elements from a flattened source image as opaque images. It does not recover original PSD/Figma layers or use external background-removal helpers.",
     elements: extracted,
     background
   };
@@ -535,43 +481,74 @@ async function editImages(args, signal) {
   }
 
   for (const input of preparedInputs) {
-    form.append("image", await fileBlob(input.path), path.basename(input.path));
+    form.append("image[]", await fileBlob(input.path), path.basename(input.path));
   }
   if (args.mask_path) {
     const mask = await prepareInputImage(args.mask_path, { ...args, preserve_alpha: true });
     form.append("mask", await fileBlob(mask.path), path.basename(mask.path));
   }
 
-  const apiResult = await requestApiJson({
+  return requestImages({
+    operation: "edit",
+    args,
+    request,
     endpoint,
     headers: authHeaders(),
     body: form,
     signal,
-    timeoutMs: requestTimeoutMs,
-    secret: apiKey
-  });
-  const saved = await persistImagesFromResponse(apiResult.json, transportOptions({
     outputDir,
-    prefix: args.filename_prefix,
-    outputFormat: args.output_format,
-    signal,
-    requestId: apiResult.request_id,
-    clientRequestId: apiResult.client_request_id
-  }));
-  return {
-    mode: "edit",
+    inputContext: inputReportForResult(preparedInputs)
+  });
+}
+
+async function requestImages({ operation, args, request, endpoint, headers, body, signal, outputDir, inputContext, onPartial }) {
+  const streamRequested = Boolean(request.stream);
+  const partialImagesRequested = streamRequested ? request.partial_images || 0 : 0;
+  const apiResult = await requestApiResponse({
     endpoint,
-    model: request.model,
-    input_context: inputReportForResult(preparedInputs),
-    images: saved,
-    raw_usage: apiResult.json.usage || null,
-    request_id: apiResult.request_id,
-    client_request_id: apiResult.client_request_id
-  };
+    headers: {
+      ...headers,
+      accept: streamRequested ? "text/event-stream" : "application/json"
+    },
+    body,
+    signal,
+    timeoutMs: requestTimeoutMs
+  });
+  try {
+    const consumed = await consumeImageApiResponse(apiResult.response, transportOptions({
+      outputDir,
+      prefix: args.filename_prefix,
+      outputFormat: args.output_format,
+      signal,
+      requestId: apiResult.request_id,
+      upstreamRequestId: apiResult.upstream_request_id,
+      clientRequestId: apiResult.client_request_id,
+      lifecycle: apiResult.lifecycle,
+      endpoint,
+      operation,
+      secret: apiKey,
+      onPartial
+    }));
+    return {
+      mode: operation,
+      endpoint,
+      model: request.model,
+      stream: streamRequested,
+      stream_requested: streamRequested,
+      response_mode: consumed.response_mode,
+      partial_images_requested: partialImagesRequested,
+      ...(inputContext ? { input_context: inputContext } : {}),
+      ...consumed
+    };
+  } finally {
+    apiResult.lifecycle.cleanup();
+  }
 }
 
 function buildJsonRequest(args) {
-  validateImageArgs(args);
+  if (Object.hasOwn(args.extra || {}, "stream") || Object.hasOwn(args.extra || {}, "partial_images")) {
+    throw invalidArgument("extra.stream and extra.partial_images are reserved. Use the top-level fields instead.");
+  }
   const request = {
     model: args.model || defaultModel,
     prompt: args.prompt,
@@ -595,9 +572,11 @@ function buildJsonRequest(args) {
     ...request,
     ...(args.extra || {})
   };
-  if (merged.background === "transparent") {
-    throw new Error("GPT Image2 does not support transparent backgrounds, alpha output, or transparent PNG generation.");
-  }
+  validateImageArgs({
+    ...merged,
+    stream: Boolean(args.stream),
+    partial_images: args.partial_images ?? 0
+  });
   return merged;
 }
 
@@ -623,7 +602,7 @@ function buildElementExtractionPrompt(element, promptPrefix) {
     element.description ? `Element identification: ${element.description}.` : "",
     element.prompt ? `Element-specific instruction: ${element.prompt}.` : "",
     promptPrefix ? `Shared instruction: ${promptPrefix}.` : "",
-    "Output an opaque PNG/WebP image. GPT Image2 does not support transparent backgrounds, alpha output, or transparent PNG generation.",
+    "Output an opaque PNG/WebP image for this extraction workflow.",
     "Focus on the requested subject. Reduce surrounding scene, UI, background, unrelated objects, labels, captions, shadows that belong to the background, and cropped neighboring elements where possible, but do not claim to create a true transparent cutout.",
     "Preserve the subject's visible style, colors, lighting, texture, proportions, silhouette, soft edges, glow, and fine details from the source image.",
     "Center the subject with a small safe margin. Do not crop the subject. Do not add a frame, canvas, sticker border, drop shadow, or new decorative elements.",
@@ -654,24 +633,50 @@ function slugifyFilename(value) {
 }
 
 function validateImageArgs(args) {
-  if (!IMAGE2_SIZES.has(args.size) && !/^\d+x\d+$/.test(args.size)) {
-    throw new Error(`Invalid size '${args.size}'. Use auto, 1024x1024, 1024x1536, 1536x1024, or a provider-supported WIDTHxHEIGHT.`);
+  if (args.size !== "auto") {
+    const match = /^(\d+)x(\d+)$/.exec(args.size || "");
+    if (!match) throw invalidArgument(`Invalid size '${args.size}'. Use auto or WIDTHxHEIGHT.`);
+    const width = Number(match[1]);
+    const height = Number(match[2]);
+    const longEdge = Math.max(width, height);
+    const shortEdge = Math.min(width, height);
+    const pixels = width * height;
+    if (longEdge > 3840 || width % 16 !== 0 || height % 16 !== 0 || longEdge / shortEdge > 3 || pixels < 655360 || pixels > 8294400) {
+      throw invalidArgument(`Invalid size '${args.size}'. Edges must be multiples of 16, max 3840px, ratio at most 3:1, and total pixels 655360-8294400.`);
+    }
   }
   if (!IMAGE2_QUALITIES.has(args.quality)) {
-    throw new Error(`Invalid quality '${args.quality}'.`);
+    throw invalidArgument(`Invalid quality '${args.quality}'.`);
   }
   if (!BACKGROUNDS.has(args.background)) {
-    throw new Error(`Invalid background '${args.background}'. GPT Image2 supports auto or opaque only; transparent output is not supported.`);
+    throw invalidArgument(`Invalid background '${args.background}'.`);
   }
   if (!OUTPUT_FORMATS.has(args.output_format)) {
-    throw new Error(`Invalid output_format '${args.output_format}'.`);
+    throw invalidArgument(`Invalid output_format '${args.output_format}'.`);
   }
   if (!MODERATIONS.has(args.moderation)) {
-    throw new Error(`Invalid moderation '${args.moderation}'.`);
+    throw invalidArgument(`Invalid moderation '${args.moderation}'.`);
   }
-  if (args.partial_images > MAX_PARTIAL_IMAGES) {
-    throw new Error("partial_images must be between 0 and 3.");
+  if (!Number.isInteger(args.n) || args.n < 1 || args.n > 10) {
+    throw invalidArgument("n must be an integer between 1 and 10.");
   }
+  if (typeof args.stream !== "undefined" && typeof args.stream !== "boolean") {
+    throw invalidArgument("stream must be a boolean.");
+  }
+  const partialImages = args.partial_images ?? 0;
+  if (!Number.isInteger(partialImages) || partialImages < 0 || partialImages > MAX_PARTIAL_IMAGES) {
+    throw invalidArgument("partial_images must be an integer between 0 and 3.");
+  }
+  if (partialImages > 0 && !args.stream) {
+    throw invalidArgument("partial_images greater than 0 requires stream=true.");
+  }
+  if (args.background === "transparent" && !new Set(["png", "webp"]).has(args.output_format)) {
+    throw invalidArgument("background=transparent requires output_format png or webp.");
+  }
+}
+
+function invalidArgument(message) {
+  return new Image2Error(message, { code: "INVALID_ARGUMENT", stage: "validation" });
 }
 
 async function prepareInputImages(args) {
@@ -725,7 +730,8 @@ async function prepareInputImage(imagePath, args = {}) {
   const maxSingleBytes = args.max_single_input_bytes || DEFAULT_MAX_SINGLE_INPUT_BYTES;
   const hasAlpha = Boolean(original.hasAlpha);
   const shouldResize = original.longEdge > maxLongEdge;
-  const shouldCompress = original.bytes > maxSingleBytes || original.ext === ".png" || original.ext === ".tiff" || original.ext === ".tif";
+  const needsFormatConversion = original.ext === ".tiff" || original.ext === ".tif";
+  const shouldCompress = original.bytes > maxSingleBytes || needsFormatConversion;
 
   if (!inputPreprocessing || process.platform !== "darwin" || (!shouldResize && !shouldCompress)) {
     return {
@@ -960,16 +966,20 @@ function positiveIntegerEnv(name, fallback) {
   return Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
-function transportOptions({ outputDir, prefix, outputFormat, signal, requestId, clientRequestId, lifecycle, endpoint }) {
+function transportOptions({ outputDir, prefix, outputFormat, signal, requestId, upstreamRequestId, clientRequestId, lifecycle, endpoint, operation, secret, onPartial }) {
   return {
     outputDir,
     prefix,
     outputFormat,
     signal,
     requestId,
+    upstreamRequestId,
     clientRequestId,
     lifecycle,
     endpoint,
+    operation,
+    secret,
+    onPartial,
     baseUrl,
     downloadTimeoutMs,
     maxOutputBytes

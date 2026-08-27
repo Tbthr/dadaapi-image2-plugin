@@ -12,12 +12,16 @@ description: Generate, edit, extract, or preview images with DadaAPI Image2. Use
 - Use `image2_extract_elements` to recreate named subjects or design elements as opaque PNG or WebP files.
 - Use `image2_doctor` to diagnose configuration, output directory, API connectivity, or model access without consuming image-generation quota.
 - Use `image2_start_generation` for slow or multi-image work, then poll with `image2_get_job`; use `image2_cancel_job` only to stop a running job.
+- For interactive partial previews, call `image2_start_generation` with `stream: true` and `partial_images: 1..3`; `image2_get_job` can expose saved partials while the job is still running. Synchronous tools return only after the final image arrives.
 - Register reused local images with `image2_register_asset` and pass `image_asset_ids` to later edits.
 - Send only the current task, target image or asset, optional mask, and up to three explicit references. Do not resend historical images or full conversation state.
 
 ## Respect limits
 
-- Do not request transparency, alpha output, transparent PNGs, true cutouts, or transparent background removal. Explain that GPT Image2 returns opaque images.
+- `gpt-image-2` supports `background: transparent` in preview for PNG and WebP outputs. Provider-compatible channels may still reject it; report that API error without switching models.
+- `image2_extract_elements` intentionally produces opaque reconstructions rather than guaranteed transparent cutouts.
+- This plugin accepts only OpenAI Images API JSON and bounded Images SSE lifecycle events (`queued`, `in_progress`, `partial_image`, `completed`). Do not treat `/v1/responses` image tool events as compatible output.
+- Partial images add image output tokens. Keep `stream: false` and `partial_images: 0` when only the final image is needed.
 - Keep image operations in this plugin unless the user explicitly requests another tool.
 - If the API key is missing, ask the user to configure `~/.codex/image2-mcp.env` instead of requesting a key in chat.
 
@@ -27,6 +31,8 @@ description: Generate, edit, extract, or preview images with DadaAPI Image2. Use
 - Before returning a path, verify that the local file exists, is non-empty, and is a PNG, JPEG, or WebP image. Never fabricate or infer an output path.
 - Render each final local image inline with its absolute path: `![Preview](/absolute/path/to/image.png)`.
 - If the error code is `INCOMPLETE_STREAM`, render any `partial_images` only as incomplete previews and say that no final image was produced.
+- If the error code is `UPSTREAM_PROTOCOL_ERROR`, report the request id and safe event diagnostics; do not attempt to parse Responses API events.
+- When both are present, use `request_id` to trace the NewAPI gateway request and `upstream_request_id` to trace the provider request.
 - Do not show visible file paths or save locations unless the user asks for them.
 - Keep progress updates short.
 

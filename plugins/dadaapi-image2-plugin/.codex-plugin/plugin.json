@@ -1,6 +1,6 @@
 {
   "name": "dadaapi-image2-plugin",
-  "version": "0.1.0+codex.20260820164512",
+  "version": "0.1.0+codex.20260827174133",
   "description": "\u54d2\u54d2API Image2 is a local GPT Image compatible Codex plugin for generating, editing, extracting, and previewing image assets.",
   "author": {
     "name": "\u54d2\u54d2API"

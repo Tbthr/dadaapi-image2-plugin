@@ -6,6 +6,8 @@ const DEFAULT_MAX_OUTPUT_BYTES = 32 * 1024 * 1024;
 const ERROR_BODY_LIMIT = 2048;
 const DOWNLOAD_RETRY_DELAY_MS = 500;
 const DOWNLOAD_RETRY_AFTER_CAP_MS = 5000;
+const RESPONSE_SNIFF_BYTES = 4096;
+const MAX_STREAM_EVENTS = 1000;
 
 export class Image2Error extends Error {
   constructor(message, options = {}) {
@@ -15,6 +17,7 @@ export class Image2Error extends Error {
     this.stage = options.stage || "plugin";
     this.status = options.status ?? null;
     this.requestId = options.requestId ?? null;
+    this.upstreamRequestId = options.upstreamRequestId ?? null;
     this.clientRequestId = options.clientRequestId ?? null;
     this.retryable = Boolean(options.retryable);
     this.details = options.details || null;
@@ -36,6 +39,7 @@ export function toPublicError(error) {
     message: normalized.message,
     status: normalized.status,
     request_id: normalized.requestId,
+    upstream_request_id: normalized.upstreamRequestId,
     client_request_id: normalized.clientRequestId,
     retryable: normalized.retryable
   };
@@ -79,9 +83,10 @@ export async function requestApiResponse({
     requestId: null,
     clientRequestId
   });
+  const responseIds = responseRequestIds(fetched.response.headers);
   return {
     response: fetched.response,
-    request_id: fetched.response.headers.get("x-request-id"),
+    ...responseIds,
     client_request_id: clientRequestId,
     lifecycle: fetched.lifecycle
   };
@@ -92,6 +97,7 @@ export async function requestApiJson(options) {
   try {
     const json = await parseApiJsonResponse(result.response, {
       requestId: result.request_id,
+      upstreamRequestId: result.upstream_request_id,
       clientRequestId: result.client_request_id,
       secret: options.secret,
       lifecycle: result.lifecycle
@@ -113,24 +119,28 @@ export async function parseApiJsonResponse(response, context = {}) {
       code: "NETWORK_ERROR",
       stage: "api_response",
       requestId: context.requestId,
+      upstreamRequestId: context.upstreamRequestId,
       clientRequestId: context.clientRequestId,
       retryable: false,
-      endpoint: response.url
+      endpoint: response.url,
+      details: responseDiagnostics(response, "")
     });
   }
+  const details = responseDiagnostics(response, text);
   let json;
   try {
     json = text ? JSON.parse(text) : {};
   } catch (cause) {
     if (!response.ok) {
-      throw new Image2Error(redactAndTruncate(text || `${response.status} ${response.statusText}`, context.secret, 500), {
+      throw new Image2Error(safeProviderMessage(text, context.secret) || `Image API request failed (HTTP ${response.status}).`, {
         code: "API_HTTP_ERROR",
         stage: "api_response",
         status: response.status,
         requestId: context.requestId,
+        upstreamRequestId: context.upstreamRequestId,
         clientRequestId: context.clientRequestId,
         retryable: isRetryableStatus(response.status),
-        details: { response: redactAndTruncate(text, context.secret) },
+        details,
         cause
       });
     }
@@ -139,22 +149,27 @@ export async function parseApiJsonResponse(response, context = {}) {
       stage: "api_response",
       status: response.status,
       requestId: context.requestId,
+      upstreamRequestId: context.upstreamRequestId,
       clientRequestId: context.clientRequestId,
-      details: { response: redactAndTruncate(text, context.secret) },
+      details,
       cause
     });
   }
 
   if (!response.ok) {
     const rawMessage = json?.error?.message || json?.message || text || `${response.status} ${response.statusText}`;
-    throw new Image2Error(redactAndTruncate(rawMessage, context.secret, 500), {
+    throw new Image2Error(safeProviderMessage(rawMessage, context.secret) || `Image API request failed (HTTP ${response.status}).`, {
       code: "API_HTTP_ERROR",
       stage: "api_response",
       status: response.status,
       requestId: context.requestId,
+      upstreamRequestId: context.upstreamRequestId,
       clientRequestId: context.clientRequestId,
       retryable: isRetryableStatus(response.status),
-      details: { response: redactAndTruncate(text, context.secret) }
+      details: {
+        ...details,
+        payload_keys: objectKeys(json)
+      }
     });
   }
   return json;
@@ -183,6 +198,7 @@ export async function persistImagesFromResponse(json, options) {
       code: "EMPTY_IMAGE_RESULT",
       stage: "image_decode",
       requestId: options.requestId,
+      upstreamRequestId: options.upstreamRequestId,
       clientRequestId: options.clientRequestId,
       retryable: false,
       details: { response_keys: objectKeys(json) }
@@ -191,13 +207,72 @@ export async function persistImagesFromResponse(json, options) {
   return saved;
 }
 
+export async function consumeImageApiResponse(response, options) {
+  const responseContentType = response.headers.get("content-type") || "";
+  if (!response.ok) {
+    await parseApiJsonResponse(response, {
+      requestId: options.requestId,
+      upstreamRequestId: options.upstreamRequestId,
+      clientRequestId: options.clientRequestId,
+      secret: options.secret,
+      lifecycle: options.lifecycle
+    });
+  }
+
+  const responseMode = await detectImageResponseMode(response, options);
+  if (responseMode === "sse") {
+    const result = await consumeImageStream(response, {
+      ...options,
+      responseContentType,
+      responseStatus: response.status
+    });
+    return {
+      response_mode: "sse",
+      http_status: response.status,
+      response_content_type: responseContentType || null,
+      ...result
+    };
+  }
+
+  const json = await parseApiJsonResponse(response, {
+    requestId: options.requestId,
+    upstreamRequestId: options.upstreamRequestId,
+    clientRequestId: options.clientRequestId,
+    secret: options.secret,
+    lifecycle: options.lifecycle
+  });
+  const images = await persistImagesFromResponse(json, options);
+  return {
+    response_mode: "json",
+    http_status: response.status,
+    response_content_type: responseContentType || null,
+    partial_images: [],
+    images,
+    raw_usage: json?.usage || null,
+    request_id: options.requestId || null,
+    upstream_request_id: options.upstreamRequestId || null,
+    client_request_id: options.clientRequestId || null
+  };
+}
+
 export async function consumeImageStream(response, options) {
   if (!response.body) {
     throw new Image2Error("Streaming response body is empty.", {
-      code: "INCOMPLETE_STREAM",
+      code: "UPSTREAM_PROTOCOL_ERROR",
       stage: "stream_parse",
+      status: options.responseStatus ?? response.status,
       requestId: options.requestId,
-      clientRequestId: options.clientRequestId
+      upstreamRequestId: options.upstreamRequestId,
+      clientRequestId: options.clientRequestId,
+      retryable: false,
+      details: {
+        response_content_type: options.responseContentType || response.headers.get("content-type") || null,
+        event_counts: {},
+        last_event_type: null,
+        done_seen: false,
+        payload_keys: [],
+        bytes_received: 0
+      }
     });
   }
 
@@ -207,48 +282,125 @@ export async function consumeImageStream(response, options) {
   const partials = [];
   const finals = [];
   let rawUsage = null;
+  const expectedPrefix = options.operation === "edit" ? "image_edit" : "image_generation";
+  const allowedTypes = new Set([
+    `${expectedPrefix}.partial_image`,
+    `${expectedPrefix}.completed`
+  ]);
+  const lifecycleTypes = new Set([
+    `${expectedPrefix}.queued`,
+    `${expectedPrefix}.in_progress`
+  ]);
+  const diagnostics = {
+    operation: options.operation === "edit" ? "edit" : "generation",
+    response_content_type: options.responseContentType || response.headers.get("content-type") || null,
+    event_counts: {},
+    last_event_type: null,
+    done_seen: false,
+    partial_count: 0,
+    completed_count: 0,
+    payload_keys: [],
+    bytes_received: 0
+  };
+  let eventCount = 0;
+  let validImageEventCount = 0;
 
   const processFrames = async (frames) => {
     for (const frame of frames) {
       const event = parseSseEvent(frame);
-      if (!event || event.data === "[DONE]") continue;
+      if (!event) continue;
+      eventCount += 1;
+      if (eventCount > MAX_STREAM_EVENTS) {
+        throw protocolFailure("Image stream exceeded the event limit.", options, diagnostics, partials);
+      }
+      if (event.data.trim() === "[DONE]") {
+        diagnostics.done_seen = true;
+        countEvent(diagnostics, "[DONE]");
+        continue;
+      }
 
+      const headerType = normalizedEventType(event.event);
       let payload;
       try {
         payload = JSON.parse(event.data);
       } catch (cause) {
+        const invalidType = headerType || "<invalid-json>";
+        diagnostics.last_event_type = invalidType;
+        countEvent(diagnostics, invalidType);
         throw new Image2Error("Image stream contained invalid JSON.", {
           code: "INVALID_IMAGE_DATA",
           stage: "stream_parse",
+          status: options.responseStatus ?? response.status,
           requestId: options.requestId,
+          upstreamRequestId: options.upstreamRequestId,
           clientRequestId: options.clientRequestId,
-          details: { event: event.event, data: truncate(event.data, 500) },
+          details: streamDiagnostics(diagnostics),
           partialImages: partials,
           cause
         });
       }
 
-      if (event.event === "error" || payload?.error) {
-        const message = payload?.error?.message || payload?.message || "Image stream returned an error event.";
-        throw new Image2Error(truncate(String(message), 500), {
+      mergePayloadKeys(diagnostics, payload);
+      const directPayloadType = normalizedEventType(payload?.type);
+      const upstreamEventType = normalizedEventType(payload?.upstream_event_type);
+      if (directPayloadType && upstreamEventType && directPayloadType !== upstreamEventType) {
+        throw protocolFailure("Image stream wrapper event types do not match.", options, diagnostics, partials);
+      }
+      const payloadType = directPayloadType || upstreamEventType;
+      const eventType = headerType || payloadType;
+      diagnostics.last_event_type = eventType || null;
+      countEvent(diagnostics, eventType || "<missing>");
+      if (headerType && payloadType && headerType !== payloadType) {
+        throw protocolFailure("Image stream event name does not match payload type.", options, diagnostics, partials);
+      }
+      const eventPayload = normalizedImageEventPayload(payload, eventType);
+      if (!eventPayload) {
+        throw protocolFailure("Image stream nested event type does not match its wrapper.", options, diagnostics, partials);
+      }
+
+      if (eventType === "error" || eventPayload?.error) {
+        const message = eventPayload?.error?.message || eventPayload?.message || "Image stream returned an error event.";
+        throw new Image2Error(safeProviderMessage(message, options.secret) || "Image stream returned an error event.", {
           code: "API_HTTP_ERROR",
           stage: "stream_parse",
+          status: options.responseStatus ?? response.status,
           requestId: options.requestId,
+          upstreamRequestId: options.upstreamRequestId,
           clientRequestId: options.clientRequestId,
           retryable: false,
+          details: streamDiagnostics(diagnostics),
           partialImages: partials
         });
       }
 
-      if (payload?.usage) rawUsage = payload.usage;
-      const eventType = `${event.event || ""} ${payload?.type || ""}`.toLowerCase();
-      const imagePayload = imagePayloadFromItem(payload);
-      if (!imagePayload) continue;
+      if (lifecycleTypes.has(eventType)) {
+        if (imagePayloadFromItem(eventPayload)) {
+          throw protocolFailure("Image stream lifecycle event unexpectedly contained an image payload.", options, diagnostics, partials);
+        }
+        validImageEventCount += 1;
+        if (eventPayload?.usage) rawUsage = eventPayload.usage;
+        continue;
+      }
 
-      if (eventType.includes("partial")) {
-        partials.push(await persistImagePayload(imagePayload, { ...options, kind: "partial" }));
-      } else if (eventType.includes("completed")) {
+      if (!eventType || !allowedTypes.has(eventType)) {
+        throw protocolFailure("Image stream contained an unsupported event type.", options, diagnostics, partials);
+      }
+      validImageEventCount += 1;
+
+      if (eventPayload?.usage) rawUsage = eventPayload.usage;
+      const imagePayload = imagePayloadFromItem(eventPayload);
+      if (!imagePayload) {
+        throw protocolFailure("Image stream event did not contain an image payload.", options, diagnostics, partials);
+      }
+
+      if (eventType.endsWith(".partial_image")) {
+        const partial = await persistImagePayload(imagePayload, { ...options, kind: "partial" });
+        partials.push(partial);
+        diagnostics.partial_count = partials.length;
+        await options.onPartial?.(partial, [...partials]);
+      } else {
         finals.push(await persistImagePayload(imagePayload, { ...options, kind: "final" }));
+        diagnostics.completed_count = finals.length;
       }
     }
   };
@@ -257,6 +409,7 @@ export async function consumeImageStream(response, options) {
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
+      diagnostics.bytes_received += value.byteLength;
       await processFrames(parser.push(decoder.decode(value, { stream: true })));
     }
     const trailingText = decoder.decode();
@@ -269,21 +422,30 @@ export async function consumeImageStream(response, options) {
       code: "NETWORK_ERROR",
       stage: "stream_parse",
       requestId: options.requestId,
+      upstreamRequestId: options.upstreamRequestId,
       clientRequestId: options.clientRequestId,
       retryable: false,
-      endpoint: options.endpoint
+      endpoint: options.endpoint,
+      details: streamDiagnostics(diagnostics)
     });
     failure.partialImages = partials;
     throw failure;
+  }
+
+  if (!validImageEventCount) {
+    throw protocolFailure("Image stream ended without a valid Images API event.", options, diagnostics, partials);
   }
 
   if (!finals.length) {
     throw new Image2Error("Image stream ended without a completed image.", {
       code: "INCOMPLETE_STREAM",
       stage: "stream_parse",
+      status: options.responseStatus ?? response.status,
       requestId: options.requestId,
+      upstreamRequestId: options.upstreamRequestId,
       clientRequestId: options.clientRequestId,
       retryable: false,
+      details: streamDiagnostics(diagnostics),
       partialImages: partials
     });
   }
@@ -293,7 +455,9 @@ export async function consumeImageStream(response, options) {
     images: finals,
     raw_usage: rawUsage,
     request_id: options.requestId || null,
-    client_request_id: options.clientRequestId || null
+    upstream_request_id: options.upstreamRequestId || null,
+    client_request_id: options.clientRequestId || null,
+    stream_diagnostics: streamDiagnostics(diagnostics)
   };
 }
 
@@ -311,6 +475,123 @@ export function parseSseEvent(frame) {
   }
   event.data = data.join("\n");
   return event.data ? event : null;
+}
+
+async function detectImageResponseMode(response, options) {
+  const contentType = response.headers.get("content-type") || "";
+  const mediaType = contentType.split(";", 1)[0].trim().toLowerCase();
+  if (mediaType === "text/event-stream") return "sse";
+  if (mediaType === "application/json" || mediaType.endsWith("+json")) return "json";
+
+  const sniffable = !mediaType || mediaType === "text/plain" || mediaType === "application/octet-stream";
+  if (sniffable) {
+    const prefix = await responsePrefix(response, RESPONSE_SNIFF_BYTES);
+    const trimmed = prefix.trimStart();
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) return "json";
+    if (trimmed.startsWith("data:") || trimmed.startsWith("event:") || trimmed.startsWith(":")) return "sse";
+  }
+
+  throw new Image2Error("Image API returned an unsupported response type.", {
+    code: "UPSTREAM_PROTOCOL_ERROR",
+    stage: "api_response",
+    status: response.status,
+    requestId: options.requestId,
+    upstreamRequestId: options.upstreamRequestId,
+    clientRequestId: options.clientRequestId,
+    retryable: false,
+    details: {
+      operation: options.operation === "edit" ? "edit" : "generation",
+      response_content_type: contentType || null
+    }
+  });
+}
+
+async function responsePrefix(response, limit) {
+  if (!response.body) return "";
+  const clone = response.clone();
+  const reader = clone.body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  try {
+    while (text.length < limit) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      text += decoder.decode(value, { stream: true });
+      if (/^\s*(?:[\[{]|data:|event:|:)/.test(text)) break;
+    }
+    text += decoder.decode();
+    return text.slice(0, limit);
+  } finally {
+    void reader.cancel().catch(() => {});
+  }
+}
+
+function normalizedEventType(value) {
+  return typeof value === "string" && value.trim() ? value.trim().toLowerCase() : null;
+}
+
+function normalizedImageEventPayload(payload, eventType) {
+  const nested = payload?.data;
+  if (!nested || typeof nested !== "object" || Array.isArray(nested)) return payload;
+  const nestedType = normalizedEventType(nested.type);
+  if (nestedType && nestedType !== eventType) return null;
+  return { ...nested, type: eventType };
+}
+
+function countEvent(diagnostics, eventType) {
+  diagnostics.event_counts[eventType] = (diagnostics.event_counts[eventType] || 0) + 1;
+}
+
+function mergePayloadKeys(diagnostics, payload) {
+  const keys = objectKeys(payload);
+  for (const key of keys) {
+    if (!diagnostics.payload_keys.includes(key) && diagnostics.payload_keys.length < 20) {
+      diagnostics.payload_keys.push(key);
+    }
+  }
+}
+
+function streamDiagnostics(diagnostics) {
+  return {
+    response_content_type: diagnostics.response_content_type,
+    event_counts: { ...diagnostics.event_counts },
+    last_event_type: diagnostics.last_event_type,
+    done_seen: diagnostics.done_seen,
+    payload_keys: [...diagnostics.payload_keys],
+    bytes_received: diagnostics.bytes_received
+  };
+}
+
+function protocolFailure(message, options, diagnostics, partialImages) {
+  return new Image2Error(message, {
+    code: "UPSTREAM_PROTOCOL_ERROR",
+    stage: "stream_parse",
+    status: options.responseStatus ?? null,
+    requestId: options.requestId,
+    upstreamRequestId: options.upstreamRequestId,
+    clientRequestId: options.clientRequestId,
+    retryable: false,
+    details: streamDiagnostics(diagnostics),
+    partialImages
+  });
+}
+
+function responseDiagnostics(response, text) {
+  return {
+    response_content_type: response.headers.get("content-type") || null,
+    payload_keys: [],
+    bytes_received: Buffer.byteLength(text || "", "utf8")
+  };
+}
+
+function safeProviderMessage(value, secret) {
+  let message = redactAndTruncate(value, secret, 500);
+  if (!message) return "";
+  message = message
+    .replace(/\b(?:sk|sess|key|token)-[A-Za-z0-9_-]{16,}\b/gi, "<redacted>")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]{12,}/gi, "Bearer <redacted>")
+    .replace(/\b[A-Za-z0-9+/]{80,}={0,2}\b/g, "<redacted-base64>");
+  return truncate(message, 500);
 }
 
 export function detectImageFormat(bytes) {
@@ -346,6 +627,17 @@ export function safeEndpoint(value) {
   }
 }
 
+function responseRequestIds(headers) {
+  const gatewayRequestId = headers.get("x-oneapi-request-id") || null;
+  const providerRequestId = headers.get("x-request-id") || null;
+  return {
+    request_id: gatewayRequestId || providerRequestId,
+    upstream_request_id: gatewayRequestId && providerRequestId && providerRequestId !== gatewayRequestId
+      ? providerRequestId
+      : null
+  };
+}
+
 async function persistImagePayload(payload, options) {
   const maxOutputBytes = positiveInteger(options.maxOutputBytes, DEFAULT_MAX_OUTPUT_BYTES);
   let bytes;
@@ -364,6 +656,7 @@ async function persistImagePayload(payload, options) {
       code: "INVALID_IMAGE_DATA",
       stage: "image_decode",
       requestId: options.requestId,
+      upstreamRequestId: options.upstreamRequestId,
       clientRequestId: options.clientRequestId,
       details: { bytes: bytes.length, source }
     });
@@ -404,6 +697,7 @@ function decodeBase64Image(value, maxOutputBytes, context) {
         code: "INVALID_IMAGE_DATA",
         stage: "image_decode",
         requestId: context.requestId,
+        upstreamRequestId: context.upstreamRequestId,
         clientRequestId: context.clientRequestId
       });
     }
@@ -415,6 +709,7 @@ function decodeBase64Image(value, maxOutputBytes, context) {
       code: "INVALID_IMAGE_DATA",
       stage: "image_decode",
       requestId: context.requestId,
+      upstreamRequestId: context.upstreamRequestId,
       clientRequestId: context.clientRequestId
     });
   }
@@ -429,6 +724,7 @@ function decodeBase64Image(value, maxOutputBytes, context) {
       code: "INVALID_IMAGE_DATA",
       stage: "image_decode",
       requestId: context.requestId,
+      upstreamRequestId: context.upstreamRequestId,
       clientRequestId: context.clientRequestId
     });
   }
@@ -445,6 +741,7 @@ async function downloadImage(value, options) {
       code: "INVALID_IMAGE_DATA",
       stage: "image_download",
       requestId: options.requestId,
+      upstreamRequestId: options.upstreamRequestId,
       clientRequestId: options.clientRequestId,
       cause
     });
@@ -454,6 +751,7 @@ async function downloadImage(value, options) {
       code: "INVALID_IMAGE_DATA",
       stage: "image_download",
       requestId: options.requestId,
+      upstreamRequestId: options.upstreamRequestId,
       clientRequestId: options.clientRequestId,
       details: { url: safeEndpoint(target) }
     });
@@ -474,6 +772,7 @@ async function downloadImage(value, options) {
         stage: "image_download",
         networkErrorCode: "IMAGE_DOWNLOAD_ERROR",
         requestId: options.requestId,
+        upstreamRequestId: options.upstreamRequestId,
         clientRequestId: options.clientRequestId
       });
       const response = fetched.response;
@@ -492,6 +791,7 @@ async function downloadImage(value, options) {
           stage: "image_download",
           status: response.status,
           requestId: options.requestId,
+          upstreamRequestId: options.upstreamRequestId,
           clientRequestId: options.clientRequestId,
           retryable,
           details: { url: safeEndpoint(target) }
@@ -506,6 +806,7 @@ async function downloadImage(value, options) {
             code: "IMAGE_DOWNLOAD_ERROR",
             stage: "image_download",
             requestId: options.requestId,
+            upstreamRequestId: options.upstreamRequestId,
             clientRequestId: options.clientRequestId,
             retryable: true,
             endpoint: target
@@ -525,6 +826,7 @@ async function downloadImage(value, options) {
     code: "IMAGE_DOWNLOAD_ERROR",
     stage: "image_download",
     requestId: options.requestId,
+    upstreamRequestId: options.upstreamRequestId,
     clientRequestId: options.clientRequestId
   });
 }
@@ -539,6 +841,7 @@ async function readResponseBytes(response, maxOutputBytes, context) {
       code: "IMAGE_DOWNLOAD_ERROR",
       stage: "image_download",
       requestId: context.requestId,
+      upstreamRequestId: context.upstreamRequestId,
       clientRequestId: context.clientRequestId
     });
   }
@@ -560,6 +863,7 @@ async function readResponseBytes(response, maxOutputBytes, context) {
       code: "INVALID_IMAGE_DATA",
       stage: "image_decode",
       requestId: context.requestId,
+      upstreamRequestId: context.upstreamRequestId,
       clientRequestId: context.clientRequestId
     });
   }
@@ -586,6 +890,7 @@ function atomicWriteImage(bytes, extension, options) {
       code: "OUTPUT_WRITE_ERROR",
       stage: "image_persist",
       requestId: options.requestId,
+      upstreamRequestId: options.upstreamRequestId,
       clientRequestId: options.clientRequestId,
       details: { directory: options.outputDir, cause: causeDetails(cause) },
       cause
@@ -605,6 +910,7 @@ async function fetchWithTimeout(url, requestOptions, context) {
       code: context.networkErrorCode,
       stage: context.stage,
       requestId: context.requestId,
+      upstreamRequestId: context.upstreamRequestId,
       clientRequestId: context.clientRequestId,
       retryable: context.stage === "image_download",
       endpoint: url
@@ -646,9 +952,10 @@ function networkFailure(cause, context) {
       code: "REQUEST_TIMEOUT",
       stage: context.stage,
       requestId: context.requestId,
+      upstreamRequestId: context.upstreamRequestId,
       clientRequestId: context.clientRequestId,
       retryable: context.retryable,
-      details: { endpoint: safeEndpoint(context.endpoint), cause: causeDetails(cause) },
+      details: { ...(context.details || {}), endpoint: safeEndpoint(context.endpoint), cause: causeDetails(cause) },
       cause
     });
   }
@@ -657,6 +964,7 @@ function networkFailure(cause, context) {
       code: "CANCELLED",
       stage: context.stage,
       requestId: context.requestId,
+      upstreamRequestId: context.upstreamRequestId,
       clientRequestId: context.clientRequestId,
       cause
     });
@@ -672,9 +980,10 @@ function networkFailure(cause, context) {
     code: context.code,
     stage: context.stage,
     requestId: context.requestId,
+    upstreamRequestId: context.upstreamRequestId,
     clientRequestId: context.clientRequestId,
     retryable: context.retryable,
-    details: { endpoint: safeEndpoint(context.endpoint), cause: causeDetails(cause) },
+    details: { ...(context.details || {}), endpoint: safeEndpoint(context.endpoint), cause: causeDetails(cause) },
     cause
   });
 }
@@ -732,6 +1041,7 @@ function outputTooLarge(maxOutputBytes, context) {
     code: "INVALID_IMAGE_DATA",
     stage: "image_decode",
     requestId: context.requestId,
+    upstreamRequestId: context.upstreamRequestId,
     clientRequestId: context.clientRequestId,
     details: { max_output_bytes: maxOutputBytes }
   });

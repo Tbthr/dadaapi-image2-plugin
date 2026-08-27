@@ -5,6 +5,7 @@ import path from "node:path";
 import test, { afterEach } from "node:test";
 import {
   Image2Error,
+  consumeImageApiResponse,
   consumeImageStream,
   detectImageFormat,
   mimeTypeForPath,
@@ -156,6 +157,148 @@ test("consumes CRLF SSE across arbitrary chunks and flushes an unterminated fina
   assert.equal(result.request_id, "req_stream");
 });
 
+test("negotiates JSON and Images SSE from actual response content types", async () => {
+  const outputDir = temporaryDirectory();
+  const json = await consumeImageApiResponse(new Response(JSON.stringify({
+    data: [{ b64_json: PNG.toString("base64") }],
+    usage: { total_tokens: 3 }
+  }), { headers: { "content-type": "application/json; charset=utf-8" } }), {
+    ...options(outputDir),
+    operation: "generation"
+  });
+  assert.equal(json.response_mode, "json");
+  assert.equal(json.images.length, 1);
+  assert.deepEqual(json.raw_usage, { total_tokens: 3 });
+
+  const sseBody = `data: {"type":"image_edit.partial_image","b64_json":"${PNG.toString("base64")}"}\n\n`
+    + `event: image_edit.completed\ndata: {"type":"image_edit.completed","b64_json":"${JPEG.toString("base64")}"}\n\n`
+    + "data: [DONE]\n\n";
+  const seenPartials = [];
+  const sse = await consumeImageApiResponse(streamResponse([sseBody]), {
+    ...options(outputDir),
+    operation: "edit",
+    onPartial: async (partial) => seenPartials.push(partial.path)
+  });
+  assert.equal(sse.response_mode, "sse");
+  assert.equal(sse.partial_images.length, 1);
+  assert.equal(sse.images.length, 1);
+  assert.deepEqual(seenPartials, [sse.partial_images[0].path]);
+});
+
+test("accepts bounded Images lifecycle events without treating them as images", async () => {
+  const outputDir = temporaryDirectory();
+  const body = [
+    'data: {"type":"image_generation.queued","status":"queued","task_id":"task_1"}\n\n',
+    'data: {"type":"image_generation.in_progress","status":"in_progress","task_id":"task_1"}\n\n',
+    `data: {"type":"image_generation.completed","b64_json":"${PNG.toString("base64")}"}\n\n`,
+    "data: [DONE]\n\n"
+  ].join("");
+  const result = await consumeImageApiResponse(streamResponse([body]), {
+    ...options(outputDir),
+    operation: "generation"
+  });
+  assert.equal(result.images.length, 1);
+  assert.equal(result.partial_images.length, 0);
+  assert.equal(result.stream_diagnostics.event_counts["image_generation.queued"], 1);
+  assert.equal(result.stream_diagnostics.event_counts["image_generation.in_progress"], 1);
+});
+
+test("accepts a bounded upstream_event_type Images wrapper", async () => {
+  const outputDir = temporaryDirectory();
+  const body = [
+    'data: {"object":"image_generation.chunk","upstream_event_type":"image_generation.queued","data":{"status":"queued"}}\n\n',
+    `data: {"object":"image_generation.chunk","upstream_event_type":"image_generation.completed","data":{"b64_json":"${PNG.toString("base64")}"}}\n\n`
+  ].join("");
+  const result = await consumeImageApiResponse(streamResponse([body]), {
+    ...options(outputDir),
+    operation: "generation"
+  });
+  assert.equal(result.images.length, 1);
+  assert.equal(result.stream_diagnostics.event_counts["image_generation.queued"], 1);
+  assert.equal(result.stream_diagnostics.event_counts["image_generation.completed"], 1);
+
+  await assert.rejects(
+    consumeImageApiResponse(streamResponse([
+      'data: {"upstream_event_type":"image_generation.completed","data":{"type":"response.completed"}}\n\n'
+    ]), {
+      ...options(outputDir),
+      operation: "generation"
+    }),
+    (error) => error.code === "UPSTREAM_PROTOCOL_ERROR"
+  );
+});
+
+test("sniffs JSON and SSE when response content type is missing or generic", async () => {
+  const outputDir = temporaryDirectory();
+  const json = await consumeImageApiResponse(new Response(JSON.stringify({
+    data: [{ b64_json: PNG.toString("base64") }]
+  })), { ...options(outputDir), operation: "generation" });
+  assert.equal(json.response_mode, "json");
+
+  const body = `event: image_generation.completed\ndata: {"type":"image_generation.completed","b64_json":"${PNG.toString("base64")}"}\n\n`;
+  const sse = await consumeImageApiResponse(new Response(body, {
+    headers: { "content-type": "text/plain" }
+  }), { ...options(outputDir), operation: "generation" });
+  assert.equal(sse.response_mode, "sse");
+  assert.equal(sse.images.length, 1);
+});
+
+test("rejects Responses API and cross-operation events with safe diagnostics", async () => {
+  const outputDir = temporaryDirectory();
+  const secretImage = PNG.toString("base64");
+  const responsesBody = `data: {"type":"response.output_item.done","item":{"type":"image_generation_call","result":"${secretImage}"}}\n\n`;
+  await assert.rejects(
+    consumeImageApiResponse(streamResponse([responsesBody]), {
+      ...options(outputDir),
+      operation: "generation",
+      secret: "api-secret"
+    }),
+    (error) => error.code === "UPSTREAM_PROTOCOL_ERROR"
+      && error.status === 200
+      && error.details.last_event_type === "response.output_item.done"
+      && error.details.event_counts["response.output_item.done"] === 1
+      && !JSON.stringify(error.details).includes(secretImage)
+      && !JSON.stringify(error.details).includes("api-secret")
+  );
+
+  const wrongPrefix = `data: {"type":"image_generation.completed","b64_json":"${secretImage}"}\n\n`;
+  await assert.rejects(
+    consumeImageApiResponse(streamResponse([wrongPrefix]), {
+      ...options(outputDir),
+      operation: "edit"
+    }),
+    (error) => error.code === "UPSTREAM_PROTOCOL_ERROR"
+      && error.details.last_event_type === "image_generation.completed"
+      && !Object.hasOwn(error.details, "operation")
+  );
+});
+
+test("rejects mismatched event headers and unsupported success content types", async () => {
+  const outputDir = temporaryDirectory();
+  const mismatch = `event: image_generation.partial_image\ndata: {"type":"image_generation.completed","b64_json":"${PNG.toString("base64")}"}\n\n`;
+  await assert.rejects(
+    consumeImageApiResponse(streamResponse([mismatch]), {
+      ...options(outputDir),
+      operation: "generation"
+    }),
+    (error) => error.code === "UPSTREAM_PROTOCOL_ERROR"
+  );
+  await assert.rejects(
+    consumeImageApiResponse(new Response("<html>ok</html>", {
+      headers: { "content-type": "text/html" }
+    }), { ...options(outputDir), operation: "generation" }),
+    (error) => error.code === "UPSTREAM_PROTOCOL_ERROR"
+      && error.details.response_content_type === "text/html"
+  );
+  await assert.rejects(
+    consumeImageApiResponse(streamResponse([]), {
+      ...options(outputDir),
+      operation: "generation"
+    }),
+    (error) => error.code === "UPSTREAM_PROTOCOL_ERROR"
+  );
+});
+
 test("reports malformed SSE with saved partial paths", async () => {
   const outputDir = temporaryDirectory();
   const body = `event: image_generation.partial_image\ndata: {\"type\":\"image_generation.partial_image\",\"b64_json\":\"${PNG.toString("base64")}\"}\n\nevent: image_generation.completed\ndata: {bad json}\n\n`;
@@ -177,6 +320,19 @@ test("does not promote a partial image when the stream has no completed event", 
   );
 });
 
+test("reports an Images lifecycle-only stream as incomplete", async () => {
+  await assert.rejects(
+    consumeImageApiResponse(streamResponse([
+      'data: {"type":"image_edit.queued","status":"queued","task_id":"task_1"}\n\n'
+    ]), {
+      ...options(temporaryDirectory()),
+      operation: "edit"
+    }),
+    (error) => error.code === "INCOMPLETE_STREAM"
+      && error.details.event_counts["image_edit.queued"] === 1
+  );
+});
+
 test("surfaces explicit SSE error events", async () => {
   const outputDir = temporaryDirectory();
   const body = "event: error\ndata: {\"error\":{\"message\":\"provider failed\"}}\n\n";
@@ -186,7 +342,7 @@ test("surfaces explicit SSE error events", async () => {
   );
 });
 
-test("adds client request IDs and returns provider request IDs", async () => {
+test("adds client request IDs and preserves gateway and upstream request IDs", async () => {
   let clientRequestId;
   const result = await requestApiJson({
     endpoint: "https://provider.example/v1/images/generations",
@@ -195,12 +351,19 @@ test("adds client request IDs and returns provider request IDs", async () => {
     timeoutMs: 100,
     fetchImpl: async (_url, request) => {
       clientRequestId = request.headers.get("x-client-request-id");
-      return new Response("{\"data\":[]}", { status: 200, headers: { "x-request-id": "req_123" } });
+      return new Response("{\"data\":[]}", {
+        status: 200,
+        headers: {
+          "x-oneapi-request-id": "gateway_req_123",
+          "x-request-id": "upstream_req_123"
+        }
+      });
     }
   });
   assert.match(clientRequestId, /^[0-9a-f-]{36}$/);
   assert.equal(result.client_request_id, clientRequestId);
-  assert.equal(result.request_id, "req_123");
+  assert.equal(result.request_id, "gateway_req_123");
+  assert.equal(result.upstream_request_id, "upstream_req_123");
 });
 
 test("returns sanitized HTTP and network diagnostics", async () => {
@@ -271,9 +434,20 @@ test("keeps the API timeout active while reading the response body", async () =>
             controller.error(new DOMException("aborted", "AbortError"));
           }, { once: true });
         }
-      }), { status: 200 })
+      }), {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "x-oneapi-request-id": "gateway_timeout",
+          "x-request-id": "upstream_timeout"
+        }
+      })
     }),
-    (error) => error.code === "REQUEST_TIMEOUT" && error.stage === "api_response"
+    (error) => error.code === "REQUEST_TIMEOUT"
+      && error.stage === "api_response"
+      && error.requestId === "gateway_timeout"
+      && error.upstreamRequestId === "upstream_timeout"
+      && error.details.response_content_type === "application/json"
   );
 });
 
@@ -303,6 +477,7 @@ function options(outputDir) {
     downloadTimeoutMs: 100,
     maxOutputBytes: 1024,
     requestId: "req_test",
+    upstreamRequestId: "upstream_req_test",
     clientRequestId: "client_test"
   };
 }

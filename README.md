@@ -1,6 +1,6 @@
 # 哒哒API Image2
 
-哒哒API Image2 是用于生成、编辑和提取图片元素的 Codex 插件，也可作为独立 MCP server 使用。GPT Image2 不支持透明背景、alpha 通道或透明 PNG 输出。
+哒哒API Image2 是用于生成、编辑和提取图片元素的 Codex 插件，也可作为独立 MCP server 使用。插件只处理 OpenAI Images API JSON/SSE，不兼容 `/v1/responses` 的 image tool 事件。
 
 ## 安装插件
 
@@ -42,11 +42,13 @@ IMAGE2_MAX_OUTPUT_BYTES=33554432
 
 插件同时接受 API 返回的 base64、data URL 和 HTTP(S) 图片 URL。所有结果都会校验为 PNG、JPEG 或 WebP，再以原子写入方式保存到本地；空结果、无效图片和流式响应缺少最终图都会明确返回错误，不再伪装成成功。
 
-失败结果包含稳定的 `error.code`、失败阶段、HTTP 状态和 request id。主要错误码包括：
+生成与编辑均支持请求级 `stream`。插件会按上游实际 `Content-Type` 协商 JSON 或 Images SSE，因此上游未按请求模式响应时仍可安全降级。流解析仅接受同端点的 `queued`、`in_progress`、`partial_image`、`completed` 生命周期以及 `error`/`[DONE]`；sub2api 渠道使用 `upstream_event_type` 包装时也必须命中同一白名单并通过内外事件名一致性检查。所有 Responses API、跨端点和其他未知事件都会被拒绝。`partial_images` 仅能与 `stream=true` 一起使用，每张 partial 会增加图片输出 token；异步生成任务可在 `running` 状态通过 `image2_get_job` 读取已保存的 partial。`gpt-image-2` 的透明背景为 preview 能力，仅适用于 PNG/WebP；兼容渠道不支持时会原样返回结构化上游错误。
+
+失败结果包含稳定的 `error.code`、失败阶段、HTTP 状态和 request id。经过 NewAPI 等中间网关时，`request_id` 优先表示网关本机请求，`upstream_request_id` 保留上游服务请求，便于分别核对两层日志。主要错误码包括：
 
 - `CONFIG_ERROR`、`API_HTTP_ERROR`、`NETWORK_ERROR`、`REQUEST_TIMEOUT`、`CANCELLED`
 - `EMPTY_IMAGE_RESULT`、`INVALID_IMAGE_DATA`、`IMAGE_DOWNLOAD_ERROR`
-- `INCOMPLETE_STREAM`、`OUTPUT_WRITE_ERROR`
+- `INCOMPLETE_STREAM`、`UPSTREAM_PROTOCOL_ERROR`、`OUTPUT_WRITE_ERROR`
 
 插件采用额度优先策略：生成或编辑请求不会被自动重发。远程图片下载遇到网络错误或 408、429、5xx 时，只会针对同一个结果 URL 重试一次，避免重复生成和重复扣费。
 
