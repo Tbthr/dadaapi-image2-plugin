@@ -24,25 +24,41 @@ codex plugin add dadaapi-image2-plugin@dadaapi
 
 将 [`.env.example`](plugins/dadaapi-image2-plugin/.env.example) 复制为 `~/.codex/image2-mcp.env`，再填写 API Key。不要将真实 Key 提交到仓库。
 
+### 选择图像模型
+
+安装和首次配置时，按主要用途选择模型。OpenAI 将 GPT Image 2.5 Flare 定位为速度优先的高质量日常模型，将 GPT Image 2.5 Sunburst 定位为更适合高要求生成和精细编辑的模型。对一般生图，建议先选 Flare；如果更看重对参考图的细节控制和编辑精度，选 Sunburst。具体效果和耗时会随提示词、参考图、尺寸和质量设置变化。[模型选择指南](https://developers.openai.com/api/docs/guides/image-prompting) [Flare 模型说明](https://developers.openai.com/api/docs/models/gpt-image-2.5-flare) [Sunburst 模型说明](https://developers.openai.com/api/docs/models/gpt-image-2.5-sunburst)
+
+| 模型 | 适用场景 |
+| --- | --- |
+| `gpt-image-2.5-flare` | 日常文生图和快速迭代；优先考虑生成速度。 |
+| `gpt-image-2.5-sunburst` | 复杂或高要求的成图、精细编辑、需要更强细节控制的任务。 |
+| `gpt-image-2` | 当前 API Key 或渠道没有开放 2.5 时的兼容选择。 |
+
+OpenAI 文档列出的 Flare 与 Sunburst token 费率相同。两个 2.5 模型都支持生成、编辑和透明背景；兼容渠道仍可能不支持某项能力。插件当前的 `quality` 参数只开放 `auto`、`low`、`medium`、`high`，尚未开放模型 API 提供的 `xhigh` 和 `max`。
+
+把选定的模型 ID 写入 `IMAGE2_MODEL` 后，插件会将它用于生成、编辑和元素提取。所选模型需要对当前 API Key 可见；配置后可运行 `image2_doctor` 检查。当前未设置该变量时，插件仍默认使用 `gpt-image-2`。
+
 ```env
 IMAGE2_API_KEY=你的哒哒API Key
 IMAGE2_BASE_URL=https://dadaapi.com
-IMAGE2_MODEL=gpt-image-2
+IMAGE2_MODEL=gpt-image-2.5-flare
 IMAGE2_DEFAULT_OUTPUT_DIR=~/.codex/mcp/dadaapi-image2-plugin/assets
 IMAGE2_REQUEST_TIMEOUT_MS=300000
 IMAGE2_DOWNLOAD_TIMEOUT_MS=60000
 IMAGE2_MAX_OUTPUT_BYTES=33554432
 ```
 
+需要精细编辑时，把 `IMAGE2_MODEL` 改为 `gpt-image-2.5-sunburst`；如果当前 API Key 不可见 2.5 模型，则改为 `gpt-image-2`。插件介绍和启动示例会引导用户选择模型；选定值保存在这个配置文件中。已有用户需要手动修改现有的 `~/.codex/image2-mcp.env`，插件更新不会覆盖该文件。
+
 重启 Codex 或开启新线程后，使用 `@dadaapi-image2-plugin` 调用插件。
 
 ## 诊断与失败处理
 
-调用 `image2_doctor` 可以检查 Node 版本、API Key 配置、输出目录写权限、API 连通性和 `gpt-image-2` 可见性。该检查不会生成图片，也不会消耗图片生成额度。服务商不支持 `/v1/models` 时会返回 warning，不会阻止继续使用生成工具。
+调用 `image2_doctor` 可以检查 Node 版本、API Key 配置、输出目录写权限、API 连通性和 `IMAGE2_MODEL` 指定模型的可见性。该检查不会生成图片，也不会消耗图片生成额度。服务商不支持 `/v1/models` 时会返回 warning，不会阻止继续使用生成工具。
 
 插件同时接受 API 返回的 base64、data URL 和 HTTP(S) 图片 URL。所有结果都会校验为 PNG、JPEG 或 WebP，再以原子写入方式保存到本地；空结果、无效图片和流式响应缺少最终图都会明确返回错误，不再伪装成成功。
 
-生成与编辑均支持请求级 `stream`。插件会按上游实际 `Content-Type` 协商 JSON 或 Images SSE，因此上游未按请求模式响应时仍可安全降级。流解析仅接受同端点的 `queued`、`in_progress`、`partial_image`、`completed` 生命周期以及 `error`/`[DONE]`；sub2api 渠道使用 `upstream_event_type` 包装时也必须命中同一白名单并通过内外事件名一致性检查。所有 Responses API、跨端点和其他未知事件都会被拒绝。`partial_images` 仅能与 `stream=true` 一起使用，每张 partial 会增加图片输出 token；异步生成任务可在 `running` 状态通过 `image2_get_job` 读取已保存的 partial。`gpt-image-2` 的透明背景为 preview 能力，仅适用于 PNG/WebP；兼容渠道不支持时会原样返回结构化上游错误。
+生成与编辑均支持请求级 `stream`。插件会按上游实际 `Content-Type` 协商 JSON 或 Images SSE，因此上游未按请求模式响应时仍可安全降级。流解析仅接受同端点的 `queued`、`in_progress`、`partial_image`、`completed` 生命周期以及 `error`/`[DONE]`；sub2api 渠道使用 `upstream_event_type` 包装时也必须命中同一白名单并通过内外事件名一致性检查。所有 Responses API、跨端点和其他未知事件都会被拒绝。`partial_images` 仅能与 `stream=true` 一起使用，每张 partial 会增加图片输出 token；异步生成任务可在 `running` 状态通过 `image2_get_job` 读取已保存的 partial。`gpt-image-2.5-flare` 和 `gpt-image-2.5-sunburst` 支持 PNG/WebP 透明背景；`gpt-image-2` 的透明背景仍为 preview 能力。兼容渠道不支持时会原样返回结构化上游错误。
 
 失败结果包含稳定的 `error.code`、失败阶段、HTTP 状态和 request id。经过 NewAPI 等中间网关时，`request_id` 优先表示网关本机请求，`upstream_request_id` 保留上游服务请求，便于分别核对两层日志。主要错误码包括：
 

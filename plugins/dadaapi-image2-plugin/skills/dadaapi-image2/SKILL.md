@@ -18,7 +18,10 @@ description: Generate, edit, extract, or preview images with DadaAPI Image2. Use
 
 ## Respect limits
 
-- `gpt-image-2` supports `background: transparent` in preview for PNG and WebP outputs. Provider-compatible channels may still reject it; report that API error without switching models.
+- If the user asks which model to choose, recommend `gpt-image-2.5-flare` for fast everyday generation and `gpt-image-2.5-sunburst` when demanding quality or precise editing matters most. Use `gpt-image-2` when the user's API key or channel does not expose GPT Image 2.5.
+- The persistent default is `IMAGE2_MODEL` in `~/.codex/image2-mcp.env`; a model passed to one tool call applies to that request. Run `image2_doctor` after changing the configured model to check visibility.
+- GPT Image 2.5 Flare and Sunburst support transparent PNG/WebP output. `gpt-image-2` supports transparent output in preview. Provider-compatible channels may reject these features; report that API error without switching models.
+- The API supports `xhigh` and `max` quality for GPT Image 2.5, but this plugin currently exposes only `auto`, `low`, `medium`, and `high`.
 - `image2_extract_elements` intentionally produces opaque reconstructions rather than guaranteed transparent cutouts.
 - This plugin accepts only OpenAI Images API JSON and bounded Images SSE lifecycle events (`queued`, `in_progress`, `partial_image`, `completed`). Do not treat `/v1/responses` image tool events as compatible output.
 - Partial images add image output tokens. Keep `stream: false` and `partial_images: 0` when only the final image is needed.
