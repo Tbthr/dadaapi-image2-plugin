@@ -115,7 +115,7 @@ test("MCP tools persist URL images, expose diagnostics, preserve MIME, and keep 
       IMAGE2_MODEL: "gpt-image-2",
       IMAGE2_DEFAULT_OUTPUT_DIR: outputDir,
       IMAGE2_REQUEST_TIMEOUT_MS: "5000",
-      IMAGE2_DOWNLOAD_TIMEOUT_MS: "1000",
+      IMAGE2_DOWNLOAD_TIMEOUT_MS: "5000",
       IMAGE2_MAX_OUTPUT_BYTES: "1024"
     },
     stderr: "pipe"

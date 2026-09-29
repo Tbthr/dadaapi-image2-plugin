@@ -12,6 +12,8 @@
     "mcp",
     "image-generation",
     "gpt-image-2",
+    "gpt-image-2.5-flare",
+    "gpt-image-2.5-sunburst",
     "image-editing",
     "codex"
   ],
@@ -19,7 +21,7 @@
   "interface": {
     "displayName": "\u54d2\u54d2API Image2",
     "shortDescription": "Generate and edit images with \u54d2\u54d2API previews",
-    "longDescription": "Use \u54d2\u54d2API Image2 to generate images, edit images, extract opaque assets from flattened designs, and run async image jobs from Codex. The plugin reads API settings from ~/.codex/image2-mcp.env, saves output locally, and returns generated images as inline previews whenever possible.",
+    "longDescription": "Use \u54d2\u54d2API Image2 to generate images, edit images, extract opaque assets from flattened designs, and run async image jobs from Codex. Choose GPT Image 2.5 Flare for fast everyday generation or GPT Image 2.5 Sunburst for demanding quality and precise editing; set IMAGE2_MODEL in ~/.codex/image2-mcp.env. Use gpt-image-2 when GPT Image 2.5 is unavailable to your API key or channel. The plugin saves output locally and returns generated images as inline previews whenever possible.",
     "developerName": "\u54d2\u54d2API",
     "category": "Creativity",
     "websiteURL": "https://dadaapi.com",
@@ -29,6 +31,7 @@
       "Write"
     ],
     "defaultPrompt": [
+      "\u5e2e\u6211\u9009\u62e9\u8fd9\u4e2a\u63d2\u4ef6\u7684\u56fe\u50cf\u6a21\u578b\uff1aFlare \u9002\u5408\u5feb\u901f\u65e5\u5e38\u751f\u6210\uff0cSunburst \u9002\u5408\u9ad8\u8981\u6c42\u6210\u56fe\u548c\u7cbe\u7ec6\u7f16\u8f91\u3002\u8bf7\u6309\u6211\u7684\u7528\u9014\u63a8\u8350\uff0c\u5e76\u544a\u8bc9\u6211\u5982\u4f55\u8bbe\u7f6e IMAGE2_MODEL\u3002",
       "Generate an image and show me the preview",
       "Edit this image and preview the result",
       "Extract transparent elements from this design"
